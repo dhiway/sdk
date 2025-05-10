@@ -29,6 +29,10 @@ use polkadot_omni_node_lib::{
 struct CliConfig;
 
 impl CliConfigT for CliConfig {
+	fn impl_name() -> String {
+		"Parity Polkadot Parachain".into()
+	}
+
 	fn impl_version() -> String {
 		let commit_hash = env!("SUBSTRATE_CLI_COMMIT_HASH");
 		format!("{}-{commit_hash}", NODE_VERSION)
