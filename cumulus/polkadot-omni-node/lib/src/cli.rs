@@ -42,18 +42,21 @@ use std::{
 /// The related info is shown to the customer as part of logs or help messages.
 /// It does not impact functionality.
 pub trait CliConfig {
+	/// The name of the resulting chain.
+	fn impl_name() -> String;
+
 	/// The version of the resulting node binary.
 	fn impl_version() -> String;
 
 	/// The description of the resulting node binary.
 	fn description(executable_name: String) -> String {
 		format!(
-			"The command-line arguments provided first will be passed to the parachain node, \n\
+			"The command-line arguments provided first will be passed to the chain node, \n\
 			and the arguments provided after -- will be passed to the relay chain node. \n\
 			\n\
 			Example: \n\
 			\n\
-			{} [parachain-args] -- [relay-chain-args]",
+			{} [chain-args] -- [relay-chain-args]",
 			executable_name
 		)
 	}
