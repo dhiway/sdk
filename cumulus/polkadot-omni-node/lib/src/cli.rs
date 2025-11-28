@@ -42,6 +42,9 @@ use std::{
 /// The related info is shown to the customer as part of logs or help messages.
 /// It does not impact functionality.
 pub trait CliConfig {
+	/// The name of the resulting chain.
+	fn impl_name() -> String;
+
 	/// The version of the resulting node binary.
 	fn impl_version() -> String;
 
