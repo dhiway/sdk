@@ -1,6 +1,6 @@
 [package]
 name = "sc-hop"
-version = "0.2.0"
+version = "0.2.1"
 authors.workspace = true
 edition.workspace = true
 license = "GPL-3.0-or-later WITH Classpath-exception-2.0"
@@ -27,6 +27,9 @@ clap = { workspace = true, features = ["derive"] }
 
 # RPC
 jsonrpsee = { workspace = true, features = ["client", "macros", "server"] }
+
+# Metrics
+prometheus-endpoint = { workspace = true, default-features = true }
 
 # Substrate primitives (client-side, always with std)
 polkadot-primitives = { workspace = true, default-features = true }

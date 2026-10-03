@@ -287,7 +287,8 @@ impl pallet_assets::Config<TrustBackedAssetsInstance> for Runtime {
 	type Freezer = AssetsFreezer;
 	type Extra = ();
 	type WeightInfo = weights::pallet_assets_local::WeightInfo<Runtime>;
-	type CallbackHandle = pallet_assets::AutoIncAssetId<Runtime, TrustBackedAssetsInstance>;
+	type CallbackHandle = ();
+	type AssetIdAllocator = pallet_assets::AutoIncAssetId<Runtime, TrustBackedAssetsInstance>;
 	type AssetAccountDeposit = AssetAccountDeposit;
 	type RemoveItemsLimit = ConstU32<1000>;
 	#[cfg(feature = "runtime-benchmarks")]
@@ -335,6 +336,7 @@ impl pallet_assets::Config<PoolAssetsInstance> for Runtime {
 	type Extra = ();
 	type WeightInfo = weights::pallet_assets_pool::WeightInfo<Runtime>;
 	type CallbackHandle = ();
+	type AssetIdAllocator = ();
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = ();
 }
@@ -580,6 +582,7 @@ impl pallet_assets::Config<ForeignAssetsInstance> for Runtime {
 	type Extra = ();
 	type WeightInfo = weights::pallet_assets_foreign::WeightInfo<Runtime>;
 	type CallbackHandle = ();
+	type AssetIdAllocator = ();
 	type AssetAccountDeposit = ForeignAssetsAssetAccountDeposit;
 	type RemoveItemsLimit = frame_support::traits::ConstU32<1000>;
 	#[cfg(feature = "runtime-benchmarks")]
@@ -2008,6 +2011,41 @@ impl_runtime_apis! {
 						id: AssetId(Location::parent()),
 						fun: Fungible(ExistentialDeposit::get()),
 					}
+				}
+
+				fn get_assets(n: u32) -> XcmAssets {
+					use frame_support::{assert_ok, traits::tokens::fungible::{Inspect, Mutate}};
+					let account: AccountId = frame_benchmarking::whitelisted_caller();
+					assert_ok!(<Balances as Mutate<_>>::mint_into(
+						&account,
+						<Balances as Inspect<_>>::minimum_balance(),
+					));
+					let amount = 1_000_000u128;
+					// Worst case: `n` distinct `ForeignAssets`. Keyed by a full `Location`, they
+					// book more proof size per deposit than trust-backed assets, and match later
+					// in `AssetTransactors`.
+					let assets: Vec<Asset> = (0..n)
+						.map(|i| {
+							// Another chain's assets pallet, so the id is genuinely foreign.
+							let asset_location = Location::new(
+								1,
+								[Parachain(3000), PalletInstance(53), GeneralIndex((1984 + i).into())],
+							);
+							assert_ok!(ForeignAssets::force_create(
+								RuntimeOrigin::root(),
+								asset_location.clone().into(),
+								account.clone().into(),
+								true,
+								1u128,
+							));
+							Asset { id: AssetId(asset_location), fun: Fungible(amount) }
+						})
+						.collect();
+					assets.into()
+				}
+
+				fn batch_call(calls: Vec<RuntimeCall>) -> Option<RuntimeCall> {
+					Some(RuntimeCall::Utility(pallet_utility::Call::batch { calls }))
 				}
 			}
 
