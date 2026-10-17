@@ -1264,8 +1264,10 @@ impl Store {
 		let mut path: std::path::PathBuf = path.into();
 		path.push("statements");
 
+		Self::preflight_full_replication_layout(&path, &config)?;
 		Self::migrate_columns(&path)?;
 		let db = Self::open_db(&path)?;
+		Self::validate_full_replication_state(&db, &config)?;
 		let needs_index_migration = Self::check_db_version(&db)?;
 
 		let storage_reader =
@@ -1289,24 +1291,45 @@ impl Store {
 				NUM_FILTER_WORKERS,
 			),
 		};
-		// Legacy empty journal rows cannot establish which removal they belong to.
-		// Gate activation before migration/maintenance can erase a newer legacy ban.
-		store.validate_full_replication_state()?;
 		store.populate(needs_index_migration)?;
 		Ok(store)
 	}
 
-	/// Full replicas must not start with records that cannot be repaired, or tombstones
-	/// whose historical automatic/explicit cause cannot be recovered. This preflight runs
-	/// before any legacy journal reconciliation; even an apparently due row is ambiguous.
-	/// Recovery uses the existing disabled-mode suppression policy and maintenance before retrying.
-	fn validate_full_replication_state(&self) -> Result<()> {
-		let config = self.submit_index.read().config;
+	/// Check authoritative v1 columns before adding any current index columns. The
+	/// ordinary write-open below rechecks state under its own lock before version updates.
+	fn preflight_full_replication_layout(path: &std::path::Path, config: &Config) -> Result<()> {
+		if config.full_replication.is_none() {
+			return Ok(());
+		}
+		let Some(metadata) =
+			parity_db::Options::load_metadata(path).map_err(|e| Error::Db(e.to_string()))?
+		else {
+			return Ok(());
+		};
+		if metadata.columns.len() <= col::EXPIRED as usize {
+			return Err(Error::Db("Statement database lacks authoritative columns".into()));
+		}
+		if metadata.columns.len() >= col::COUNT as usize {
+			return Ok(());
+		}
+		let mut options = parity_db::Options::with_columns(path, 0);
+		options.columns = metadata.columns;
+		// This opens the same database in its existing layout. ParityDB still performs
+		// native log recovery; no application migration or provenance inference runs.
+		let db = parity_db::Db::open_read_only(&options).map_err(|e| Error::Db(e.to_string()))?;
+		Self::validate_full_replication_state(&db, config)
+	}
+
+	/// Full replicas must not start with unsendable records or unclassified suppression.
+	/// Validate before version updates, index migration and maintenance: even an apparently
+	/// due legacy row is ambiguous. Recovery uses the existing disabled-mode suppression
+	/// policy and maintenance before retrying.
+	fn validate_full_replication_state(db: &parity_db::Db, config: &Config) -> Result<()> {
 		if config.full_replication.is_none() {
 			return Ok(());
 		}
 		let mut invalid = None;
-		self.db.iter_column_while(col::EXPIRED, |item| {
+		db.iter_column_while(col::EXPIRED, |item| {
 			match Eviction::decode(&item.value, config.purge_after_sec) {
 				Ok(ban) if ban.explicit.is_none() => {
 					invalid = Some(Error::InvalidConfig(format!(
@@ -1322,7 +1345,7 @@ impl Store {
 			return Err(error);
 		}
 		let limit = sc_network_statement::config::FULL_REPLICATION_MAX_STATEMENT_SIZE;
-		self.db.iter_column_while(col::STATEMENTS, |item| {
+		db.iter_column_while(col::STATEMENTS, |item| {
 			if item.value.len() > limit {
 				invalid = Some(Error::InvalidConfig(format!(
 					"full replication retained statement {} encodes to {} bytes, exceeding wire-safe limit {}; remove it explicitly with full replication disabled before enabling",
@@ -4178,12 +4201,12 @@ mod tests {
 		let expired_ts = 10_000_000_000u64;
 
 		// Build a version-1 database by hand: three columns and no on-disk read index.
+		let mut cfg = parity_db::Options::with_columns(&db_path, 3);
+		let statement_col = &mut cfg.columns[1];
+		statement_col.ref_counted = false;
+		statement_col.preimage = true;
+		statement_col.uniform = true;
 		{
-			let mut cfg = parity_db::Options::with_columns(&db_path, 3);
-			let statement_col = &mut cfg.columns[1];
-			statement_col.ref_counted = false;
-			statement_col.preimage = true;
-			statement_col.uniform = true;
 			let db = parity_db::Db::open_or_create(&cfg).unwrap();
 			db.commit([
 				(0u8, b"version".to_vec(), Some(1u32.to_le_bytes().to_vec())),
@@ -4192,6 +4215,33 @@ mod tests {
 				(2u8, expired_hash.to_vec(), Some((expired_hash, expired_ts).encode())),
 			])
 			.unwrap();
+		}
+
+		// Refused full activation must preserve the *genuine* v1 layout, not merely
+		// its version marker. In particular, no add_column may run before this gate.
+		let metadata_before = std::fs::read(db_path.join("metadata")).unwrap();
+		let result = Store::new::<Block, TestClient, TestBackend>(
+			&path,
+			crate::Config { full_replication: Some(Default::default()), ..Default::default() },
+			std::sync::Arc::new(TestClient),
+			std::sync::Arc::new(sc_keystore::LocalKeystore::in_memory()),
+			None,
+			Box::new(sp_core::testing::TaskExecutor::new()),
+		);
+		assert!(matches!(result, Err(crate::Error::InvalidConfig(_))));
+		assert_eq!(std::fs::read(db_path.join("metadata")).unwrap(), metadata_before);
+		assert_eq!(parity_db::Options::load_metadata(&db_path).unwrap().unwrap().columns.len(), 3);
+		{
+			// Original options must still open the same DB: nine-column expansion would
+			// make this fail before any logical-row assertions could execute.
+			let db = parity_db::Db::open(&cfg).unwrap();
+			assert_eq!(db.get(0, b"version").unwrap(), Some(1u32.to_le_bytes().to_vec()));
+			assert_eq!(db.get(1, &h_addressed).unwrap(), Some(addressed.encode()));
+			assert_eq!(db.get(1, &h_broadcast).unwrap(), Some(broadcast.encode()));
+			assert_eq!(
+				db.get(2, expired_hash.as_ref()).unwrap(),
+				Some((expired_hash, expired_ts).encode())
+			);
 		}
 
 		let open = |path: &std::path::Path| {

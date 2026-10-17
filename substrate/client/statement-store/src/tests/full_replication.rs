@@ -251,6 +251,44 @@ fn legacy_stale_purge_cannot_erase_a_newer_legacy_ban_before_activation() {
 }
 
 #[test]
+fn legacy_rejection_precedes_missing_version_initialization() {
+	let (store, temp) = test_store();
+	let hash = statement(1, 1, None, 100).hash();
+	store
+		.db
+		.commit([
+			(col::META, KEY_VERSION.to_vec(), None),
+			(col::EXPIRED, hash.to_vec(), Some((hash, store.timestamp()).encode())),
+		])
+		.unwrap();
+	let mut config = store.submit_index.read().config;
+	config.full_replication = Some(Default::default());
+	drop(store);
+	assert!(matches!(reopen(&temp, config), Err(crate::Error::InvalidConfig(_))));
+	let db = Store::open_db(&temp.path().join("db/statements")).unwrap();
+	assert_eq!(db.get(col::META, KEY_VERSION).unwrap(), None);
+	assert!(db.get(col::EXPIRED, &hash).unwrap().is_some());
+}
+
+#[test]
+fn malformed_layout_is_rejected_without_adding_missing_authoritative_columns() {
+	let temp = tempfile::tempdir().unwrap();
+	let path = temp.path().join("db/statements");
+	let options = parity_db::Options::with_columns(&path, 2);
+	{
+		let db = parity_db::Db::open_or_create(&options).unwrap();
+		db.commit([(col::META, KEY_VERSION.to_vec(), Some(1u32.to_le_bytes().to_vec()))])
+			.unwrap();
+	}
+	let before = std::fs::read(path.join("metadata")).unwrap();
+	let config = Config { full_replication: Some(Default::default()), ..Default::default() };
+	assert!(matches!(reopen(&temp, config), Err(crate::Error::Db(_))));
+	assert_eq!(std::fs::read(path.join("metadata")).unwrap(), before);
+	let db = parity_db::Db::open(&options).unwrap();
+	assert_eq!(db.get(col::META, KEY_VERSION).unwrap(), Some(1u32.to_le_bytes().to_vec()));
+}
+
+#[test]
 fn stale_legacy_and_tagged_purges_cannot_erase_a_new_explicit_ban() {
 	for legacy in [false, true] {
 		let (mut store, _temp) = full_store();
