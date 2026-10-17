@@ -50,28 +50,21 @@ fn retained(store: &Store, statements: &[Statement]) -> Vec<sp_statement_store::
 }
 
 fn assert_consistent(store: &Store) {
-	let mut count = 0;
-	let mut size = 0;
-	store
-		.db
-		.iter_column_while(col::STATEMENTS, |item| {
-			let statement = Statement::decode(&mut item.value.as_slice()).unwrap();
-			count += 1;
-			size += statement.data_len();
-			true
-		})
-		.unwrap();
-	assert_eq!(store.statement_count(), count);
-	assert_eq!(store.total_size(), size);
-	let mut bans = 0;
-	store
-		.db
-		.iter_column_while(col::EXPIRED, |_| {
-			bans += 1;
-			true
-		})
-		.unwrap();
-	assert_eq!(store.evicted_count(), bans);
+	// Hash-column raw iteration omits ParityDB's commit overlay. Ordered indexes and
+	// point reads reflect the same committed view used by live admission and queries.
+	let statements = store.statements().unwrap();
+	assert_eq!(store.statement_count(), statements.len());
+	assert_eq!(store.total_size(), statements.iter().map(|(_, s)| s.data_len()).sum::<usize>());
+	let mut bans = std::collections::HashSet::new();
+	let mut iter = store.db.iter(col::INDEX_EVICTED).unwrap();
+	iter.seek_to_first().unwrap();
+	while let Some((key, _)) = iter.next().unwrap() {
+		let (_, hash) = crate::parse_time_index_key(&key).unwrap();
+		if store.db.get(col::EXPIRED, &hash).unwrap().is_some() {
+			bans.insert(hash);
+		}
+	}
+	assert_eq!(store.evicted_count(), bans.len());
 	let mut admitted = 0;
 	let mut iter = store.db.iter(col::ADMISSION_SEQ).unwrap();
 	iter.seek_to_first().unwrap();
@@ -79,7 +72,7 @@ fn assert_consistent(store: &Store) {
 		assert!(store.has_statement(&hash.try_into().unwrap()));
 		admitted += 1;
 	}
-	assert_eq!(admitted, count);
+	assert_eq!(admitted, statements.len());
 }
 
 #[test]

@@ -1303,8 +1303,13 @@ impl Store {
 		}
 		let mut invalid = None;
 		self.db.iter_column_while(col::EXPIRED, |item| {
-			match Eviction::decode(&item.value, config.purge_after_sec) {
-				Ok(ban) if ban.explicit.is_none() => {
+			let ban = Eviction::decode(&item.value, config.purge_after_sec).and_then(|ban| {
+				// Startup maintenance may have removed this raw row in the commit overlay.
+				self.db.get(col::EXPIRED, &ban.hash).map_err(|e| Error::Db(e.to_string()))?
+					.map(|value| Eviction::decode(&value, config.purge_after_sec)).transpose()
+			});
+			match ban {
+				Ok(Some(ban)) if ban.explicit.is_none() => {
 					invalid = Some(Error::InvalidConfig(format!(
 						"full replication cannot classify legacy suppression for {}; keep full replication disabled until the existing purge journal has removed this row",
 						HexDisplay::from(&ban.hash))));
