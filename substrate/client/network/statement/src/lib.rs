@@ -2406,6 +2406,9 @@ where
 
 #[cfg(test)]
 mod tests {
+	mod full_replication_tests {
+		include!("full_replication_tests.rs");
+	}
 
 	use super::*;
 	use governor::clock::FakeRelativeClock;
