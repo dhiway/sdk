@@ -1522,17 +1522,13 @@ where
 								},
 								StatementMessage::ExplicitTopicAffinity(filter) => {
 									if let Some(peer_data) = self.peers.get_mut(&peer) {
-										if peer_data.full_replica {
-											// Full peers always receive the complete feed.
-											return;
-										}
 										if peer_data.rate_limiter.is_flooding(1) {
 											log::debug!(
 												target: LOG_TARGET,
 												"Rate-limiting ExplicitTopicAffinity from {peer}"
 											);
 											self.network.report_peer(peer, rep::BAD_MESSAGE);
-										} else {
+										} else if !peer_data.full_replica {
 											log::debug!(
 												target: LOG_TARGET,
 												"Received topic affinity filter from {peer}"
@@ -3984,6 +3980,42 @@ mod tests {
 		handler.process_pending_affinities();
 		assert_eq!(handler.pending_initial_syncs[&peers[0]].sync_id, id);
 		assert!(handler.peers[&peers[0]].pending_topic_affinity.is_none());
+	}
+
+	#[tokio::test]
+	async fn full_replication_affinity_is_rate_limited_without_resetting_replay() {
+		let (mut handler, store, network, _, _, peers) = build_handler(1);
+		enable_full_replication(&mut handler);
+		let peer = peers[0];
+		let clock = FakeRelativeClock::default();
+		let data = handler.peers.get_mut(&peer).unwrap();
+		data.protocol_version = PeerProtocolVersion::V2;
+		data.rate_limiter = PeerRateLimiter::with_clock(
+			NonZeroU32::new(1).unwrap(),
+			NonZeroU32::new(1).unwrap(),
+			&clock,
+		);
+		store.insert(new_live_statement());
+		handler.schedule_initial_sync_for_peer(peer);
+		let sync_id = handler.pending_initial_syncs[&peer].sync_id;
+		let cursor = handler.pending_initial_syncs[&peer].cursor;
+		let notification =
+			StatementMessage::ExplicitTopicAffinity(AffinityFilter::new(BLOOM_SEED, 0.01, 10))
+				.encode();
+		for _ in 0..2 {
+			handler
+				.handle_notification_event(NotificationEvent::NotificationReceived {
+					peer,
+					notification: notification.clone().into(),
+				})
+				.await;
+		}
+		handler.process_pending_affinities();
+		assert_eq!(network.get_reports(), vec![(peer, rep::BAD_MESSAGE)]);
+		assert_eq!(handler.pending_initial_syncs[&peer].sync_id, sync_id);
+		assert_eq!(handler.pending_initial_syncs[&peer].cursor, cursor);
+		assert!(handler.peers[&peer].topic_affinity.is_none());
+		assert!(handler.peers[&peer].pending_topic_affinity.is_none());
 	}
 
 	#[tokio::test]

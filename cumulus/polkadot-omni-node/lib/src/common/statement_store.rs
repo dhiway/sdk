@@ -80,15 +80,16 @@ pub(crate) fn build_statement_store<
 			spawn_handle.spawn("network-statement-validator", Some("networking"), fut);
 		})
 	};
-	let statement_handler = statement_handler_proto.build(
-		network,
-		sync_service,
-		statement_store.clone(),
-		parachain_config.prometheus_registry(),
-		statement_protocol_executor,
-		config.network_workers,
-		config.rate_limit,
-	)?;
+	let statement_handler =
+		statement_handler_proto.with_full_replication(config.full_replication).build(
+			network,
+			sync_service,
+			statement_store.clone(),
+			parachain_config.prometheus_registry(),
+			statement_protocol_executor,
+			config.network_workers,
+			config.rate_limit,
+		)?;
 	task_manager.spawn_handle().spawn(
 		"network-statement-handler",
 		Some("networking"),

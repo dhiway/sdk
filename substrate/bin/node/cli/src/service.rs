@@ -795,15 +795,17 @@ pub fn new_full_base<N: NetworkBackend<Block, <Block as BlockT>::Hash>>(
 			spawn_handle.spawn("network-statement-validator", Some("networking"), fut);
 		})
 	};
-	let statement_handler = statement_handler_proto.build(
-		network.clone(),
-		sync_service.clone(),
-		statement_store.clone(),
-		prometheus_registry.as_ref(),
-		statement_protocol_executor,
-		statement_store_config.network_workers,
-		statement_store_config.rate_limit,
-	)?;
+	let statement_handler = statement_handler_proto
+		.with_full_replication(statement_store_config.full_replication)
+		.build(
+			network.clone(),
+			sync_service.clone(),
+			statement_store.clone(),
+			prometheus_registry.as_ref(),
+			statement_protocol_executor,
+			statement_store_config.network_workers,
+			statement_store_config.rate_limit,
+		)?;
 	task_manager.spawn_handle().spawn(
 		"network-statement-handler",
 		Some("networking"),
@@ -854,6 +856,7 @@ pub fn new_full(config: Configuration, cli: Cli) -> Result<TaskManager, ServiceE
 		purge_after_sec: cli.statement_store_purge_after_sec,
 		network_workers: cli.statement_network_workers,
 		rate_limit: cli.statement_rate_limit,
+		full_replication: None,
 	};
 
 	let task_manager = match config.network.network_backend {
