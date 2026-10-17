@@ -36,14 +36,17 @@
 //!
 //! When a new statement is inserted that would not satisfy constraints in the first place, no
 //! statements are deleted and a `Rejected` result is returned.
-//! The order in which statements with the same priority are deleted is unspecified.
+//! By default, the order in which statements with the same priority are deleted is unspecified.
+//! Full replication breaks ties by signed statement hash, with the larger hash winning.
 //!
 //! ## Statement expiration
 //!
-//! Each time a statement is removed from the store (Either evicted by higher priority statement or
-//! explicitly with the `remove` function) the statement is marked as expired. Expired statements
-//! can't be added to the store for `Options::purge_after_sec` seconds. This is to prevent old
-//! statements from being propagated on the network.
+//! By default, each time a statement is removed from the store (either evicted by a higher priority
+//! statement or explicitly with the `remove` function) the statement is marked as expired. Expired
+//! statements can't be added to the store for `Options::purge_after_sec` seconds. This is to
+//! prevent old statements from being propagated on the network. In full replication mode,
+//! automatic quota eviction and channel replacement do not suppress re-admission; explicit
+//! removals retain suppression and authorized Local/Chain override.
 
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
@@ -513,6 +516,40 @@ impl StatementsForAccount {
 	}
 }
 
+/// New tombstones preserve the legacy `(hash, removal_time)` prefix, followed by a
+/// format version, explicit/automatic cause and the exact persisted deadline. Old rows
+/// remain unclassified; their meaning must never be inferred from their presence.
+struct Eviction {
+	hash: Hash,
+	purge_at: u64,
+	explicit: Option<bool>,
+}
+
+impl Eviction {
+	fn encode(hash: &Hash, removed_at: u64, purge_at: u64, explicit: bool) -> Vec<u8> {
+		(hash, removed_at, 1u8, explicit, purge_at).encode()
+	}
+
+	fn decode(value: &[u8], purge_after: u64) -> Result<Self> {
+		let mut input = value;
+		let (hash, removed_at) = <(Hash, u64)>::decode(&mut input)
+			.map_err(|_| Error::Db("Invalid eviction record".into()))?;
+		if input.is_empty() {
+			return Ok(Self {
+				hash,
+				purge_at: removed_at.saturating_add(purge_after),
+				explicit: None,
+			});
+		}
+		let (version, explicit, purge_at) = <(u8, bool, u64)>::decode(&mut input)
+			.map_err(|_| Error::Db("Invalid eviction provenance".into()))?;
+		if version != 1 || !input.is_empty() {
+			return Err(Error::Db("Unsupported eviction provenance".into()));
+		}
+		Ok(Self { hash, purge_at, explicit: Some(explicit) })
+	}
+}
+
 /// Default number of concurrent workers for statement validation.
 pub const DEFAULT_NETWORK_WORKERS: usize = 1;
 
@@ -522,6 +559,8 @@ pub use sc_network_statement::config::DEFAULT_STATEMENTS_PER_SECOND as DEFAULT_R
 /// Statement store and network handler configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
+	/// Opt-in complete retained-feed replication. Disabled by default.
+	pub full_replication: Option<sc_network_statement::config::FullReplication>,
 	/// Maximum statements allowed in the store. Once this limit is reached lower-priority
 	/// statements may be evicted.
 	pub max_total_statements: usize,
@@ -550,6 +589,16 @@ impl Config {
 		if self.network_workers == 0 {
 			return Err(Error::InvalidConfig("network_workers must be greater than zero".into()));
 		}
+		if self
+			.rate_limit
+			.checked_mul(sc_network_statement::config::STATEMENTS_BURST_COEFFICIENT)
+			.is_none()
+		{
+			return Err(Error::InvalidConfig("rate_limit burst capacity overflows u32".into()));
+		}
+		if let Some(replication) = self.full_replication {
+			replication.validate().map_err(|e| Error::InvalidConfig(e.into()))?;
+		}
 		Ok(())
 	}
 }
@@ -557,6 +606,7 @@ impl Config {
 impl Default for Config {
 	fn default() -> Self {
 		Config {
+			full_replication: None,
 			max_total_statements: DEFAULT_MAX_TOTAL_STATEMENTS,
 			max_total_size: DEFAULT_MAX_TOTAL_SIZE,
 			purge_after_sec: DEFAULT_PURGE_AFTER_SEC,
@@ -942,13 +992,20 @@ impl SubmitIndex {
 		let mut evicted_hashes = HashSet::new();
 		let mut would_free_size = 0;
 		let expiry = Expiry(statement.expiry());
+		let priority = PriorityKey { hash, expiry };
+		let full_replication = self.config.full_replication.is_some();
 		let (max_size, max_count) = (validation.max_size as usize, validation.max_count as usize);
 		// It may happen that we can't delete enough lower priority messages
 		// to satisfy size constraints. We check for that before deleting anything,
 		// taking into account channel message replacement.
 		if let Some(channel) = statement.channel() {
 			if let Some(channel_record) = record.channels.get(&channel) {
-				if expiry <= channel_record.expiry {
+				if if full_replication {
+					priority <=
+						PriorityKey { hash: channel_record.hash, expiry: channel_record.expiry }
+				} else {
+					expiry <= channel_record.expiry
+				} {
 					// Trying to replace channel message with lower expiry.
 					log::debug!(
 						target: LOG_TARGET,
@@ -996,7 +1053,7 @@ impl SubmitIndex {
 				// Already accounted for above
 				continue;
 			}
-			if entry.expiry >= expiry {
+			if if full_replication { *entry >= priority } else { entry.expiry >= expiry } {
 				log::debug!(
 					target: LOG_TARGET,
 					"Ignored message from account {} due to constraints {:?} {:?} < {:?}",
@@ -1040,7 +1097,7 @@ impl SubmitIndex {
 			.iter()
 			.filter_map(|(key, _)| {
 				let expiry_ts = key.expiry.get_expiration_timestamp_secs();
-				(current_time < expiry_ts).then(|| {
+				(!full_replication && current_time < expiry_ts).then(|| {
 					(
 						key.hash,
 						expiry_ts.min(current_time.saturating_add(self.config.purge_after_sec)),
@@ -1233,7 +1290,67 @@ impl Store {
 			),
 		};
 		store.populate(needs_index_migration)?;
+		store.validate_full_replication_state()?;
 		Ok(store)
+	}
+
+	/// Full replicas must not start with records that cannot be repaired, or tombstones
+	/// whose historical automatic/explicit cause cannot be recovered.
+	fn validate_full_replication_state(&self) -> Result<()> {
+		let config = self.submit_index.read().config;
+		if config.full_replication.is_none() {
+			return Ok(());
+		}
+		let mut invalid = None;
+		self.db.iter_column_while(col::EXPIRED, |item| {
+			match Eviction::decode(&item.value, config.purge_after_sec) {
+				Ok(ban) if ban.explicit.is_none() => {
+					invalid = Some(Error::InvalidConfig(format!(
+						"full replication cannot classify legacy suppression for {}; keep full replication disabled until the existing purge journal has removed this row",
+						HexDisplay::from(&ban.hash))));
+				},
+				Err(e) => invalid = Some(e),
+				_ => {},
+			}
+			invalid.is_none()
+		}).map_err(|e| Error::Db(e.to_string()))?;
+		if let Some(error) = invalid {
+			return Err(error);
+		}
+		let limit = sc_network_statement::config::FULL_REPLICATION_MAX_STATEMENT_SIZE;
+		self.db.iter_column_while(col::STATEMENTS, |item| {
+			if item.value.len() > limit {
+				invalid = Some(Error::InvalidConfig(format!(
+					"full replication retained statement {} encodes to {} bytes, exceeding wire-safe limit {}; remove it explicitly with full replication disabled before enabling",
+					HexDisplay::from(&sp_statement_store::hash_encoded(&item.value)), item.value.len(), limit)));
+			}
+			invalid.is_none()
+		}).map_err(|e| Error::Db(e.to_string()))?;
+		if let Some(error) = invalid {
+			return Err(error);
+		}
+		Ok(())
+	}
+
+	fn ban_applies(&self, value: Option<&[u8]>, now: u64, config: &Config) -> Result<bool> {
+		let Some(value) = value else {
+			return Ok(false);
+		};
+		if config.full_replication.is_none() {
+			return Ok(true);
+		}
+		let ban = Eviction::decode(value, config.purge_after_sec)?;
+		Ok(match ban.explicit {
+			None => true,
+			Some(false) => false,
+			Some(true) => ban.purge_at > now,
+		})
+	}
+
+	fn is_suppressed(&self, hash: &Hash, now: u64) -> Result<bool> {
+		let config = self.submit_index.read().config;
+		let value = self.db.get(col::EXPIRED, hash).map_err(|e| Error::Db(e.to_string()))?;
+		self.ban_applies(value.as_deref(), now, &config)
 	}
 
 	/// Migrate the column layout of an existing database to the current schema.
@@ -1305,7 +1422,8 @@ impl Store {
 	}
 
 	/// Restore the in-memory state from the database at startup. Statement bodies are never
-	/// decoded here, so startup cost does not depend on the size of the stored statements.
+	/// decoded here. Opt-in full replication additionally scans encoded bodies at activation
+	/// to reject retained records exceeding its wire-safe size ceiling.
 	///
 	/// A database written by an older version is first migrated with [`Self::migrate_database`].
 	// This function should only be used on startup. There should be no other DB operations when
@@ -1477,17 +1595,22 @@ impl Store {
 
 		self.db
 			.iter_column_while(col::EXPIRED, |item| {
-				if let Ok((hash, timestamp)) = <(Hash, u64)>::decode(&mut item.value.as_slice()) {
+				if let Ok(ban) = Eviction::decode(&item.value, purge_after_sec) {
+					let hash = ban.hash;
 					log::trace!(
 						target: LOG_TARGET,
 						"Statement loaded (expired): {:?}",
 						HexDisplay::from(&hash)
 					);
-					let purge_at = timestamp.saturating_add(purge_after_sec);
+					let purge_at = ban.purge_at;
 					let operation = DbOperation {
 						column: col::INDEX_EVICTED,
 						key: evicted_index_key(purge_at, &hash),
-						value: Some(INDEX_EMPTY_VALUE.to_vec()),
+						value: Some(if ban.explicit.is_some() {
+							item.value.to_vec()
+						} else {
+							INDEX_EMPTY_VALUE.to_vec()
+						}),
 					};
 					if let Err(error) = migration.push(operation) {
 						migration_error = Some(error);
@@ -1890,7 +2013,7 @@ impl Store {
 				"Evicting statement {:?} due to allowance enforcement",
 				HexDisplay::from(&key.hash)
 			);
-			if let Err(e) = self.remove(&key.hash) {
+			if let Err(e) = self.remove_statement(&key.hash, false) {
 				log::debug!(
 					target: LOG_TARGET,
 					"Error evicting statement {:?}: {:?}",
@@ -1970,7 +2093,7 @@ impl Store {
 			log::warn!(target: LOG_TARGET, "Error scanning the expiry index: {:?}", e);
 		}
 		for (expiry, hash) in due {
-			match self.remove_statement(&hash) {
+			match self.remove_statement(&hash, false) {
 				Ok(true) => {
 					expired += 1;
 					log::trace!(
@@ -2055,14 +2178,18 @@ impl Store {
 	/// Drains the on-disk evicted journal of entries whose purge deadline has passed. Returns how
 	/// many entries were drained.
 	fn drain_due_evicted(&self, current_time: u64) -> Result<usize> {
+		let mut submit_index = self.submit_index.write();
 		let mut commit: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
 		let mut drained = 0usize;
+		let mut drained_hashes = HashSet::new();
 		{
 			let mut iter =
 				self.db.iter(col::INDEX_EVICTED).map_err(|e| Error::Db(e.to_string()))?;
 			iter.seek_to_first().map_err(|e| Error::Db(e.to_string()))?;
 			loop {
-				let Some((key, _)) = iter.next().map_err(|e| Error::Db(e.to_string()))? else {
+				let Some((key, journal_value)) =
+					iter.next().map_err(|e| Error::Db(e.to_string()))?
+				else {
 					break;
 				};
 				let Some((purge_at, hash)) = parse_time_index_key(&key) else { continue };
@@ -2070,14 +2197,31 @@ impl Store {
 					// Entries are ordered by purge time, so nothing further is due.
 					break;
 				}
-				commit.push((col::EXPIRED, hash.to_vec(), None));
+				// The journal may outlive an authorized readmission and later removal.
+				// Only the exact current tombstone can be purged by a new journal row.
+				if let Some(value) =
+					self.db.get(col::EXPIRED, &hash).map_err(|e| Error::Db(e.to_string()))?
+				{
+					let ban = Eviction::decode(&value, submit_index.config.purge_after_sec)?;
+					let matches = if ban.explicit.is_none() {
+						// Historical empty journal values cannot identify provenance; retain
+						// their existing default-mode behavior. Full activation rejects them.
+						journal_value.is_empty()
+					} else {
+						ban.purge_at == purge_at && value == journal_value
+					};
+					if matches && drained_hashes.insert(hash) {
+						commit.push((col::EXPIRED, hash.to_vec(), None));
+						drained += 1;
+					}
+				}
 				commit.push((col::INDEX_EVICTED, key, None));
-				drained += 1;
 			}
 		}
 		if !commit.is_empty() {
 			self.db.commit(commit).map_err(|e| Error::Db(e.to_string()))?;
 		}
+		submit_index.evicted_count -= drained;
 		Ok(drained)
 	}
 
@@ -2105,9 +2249,7 @@ impl Store {
 		};
 
 		let (active_count, expired_count, total_size, capacity_statements, capacity_bytes) = {
-			let mut submit_index = self.submit_index.write();
-			submit_index.evicted_count =
-				submit_index.evicted_count.saturating_sub(deleted_count as usize);
+			let submit_index = self.submit_index.read();
 			(
 				submit_index.statement_count,
 				submit_index.evicted_count,
@@ -2578,18 +2720,20 @@ impl StatementStore for Store {
 			return SubmitResult::Invalid(reason);
 		}
 		let encoded_size = statement.encoded_size();
-		if encoded_size > MAX_STATEMENT_SIZE {
+		let max_size = if self.submit_index.read().config.full_replication.is_some() {
+			sc_network_statement::config::FULL_REPLICATION_MAX_STATEMENT_SIZE
+		} else {
+			MAX_STATEMENT_SIZE
+		};
+		if encoded_size > max_size {
 			log::debug!(
 				target: LOG_TARGET,
 				"Statement is too big for propogation: {:?} ({}/{} bytes)",
 				HexDisplay::from(&hash),
 				statement.encoded_size(),
-				MAX_STATEMENT_SIZE
+				max_size
 			);
-			let reason = InvalidReason::EncodingTooLarge {
-				submitted_size: encoded_size,
-				max_size: MAX_STATEMENT_SIZE,
-			};
+			let reason = InvalidReason::EncodingTooLarge { submitted_size: encoded_size, max_size };
 			self.metrics.report(|metrics| {
 				metrics.validations_invalid.with_label_values(&[reason.label()]).inc();
 			});
@@ -2606,7 +2750,7 @@ impl StatementStore for Store {
 				});
 				return SubmitResult::Known;
 			}
-		} else if self.db.get_size(col::EXPIRED, hash.as_slice()).ok().flatten().is_some() {
+		} else if self.is_suppressed(&hash, self.timestamp()).unwrap_or(true) {
 			if !source.can_be_resubmitted() {
 				self.metrics.report(|metrics| {
 					metrics.known_statements.with_label_values(&["known_expired"]).inc();
@@ -2712,6 +2856,19 @@ impl StatementStore for Store {
 				},
 			}
 
+			let previous_ban = match self.db.get(col::EXPIRED, &hash) {
+				Ok(ban) => ban,
+				Err(e) => return SubmitResult::InternalError(Error::Db(e.to_string())),
+			};
+			if !source.can_be_resubmitted() {
+				match self.ban_applies(previous_ban.as_deref(), current_time, &submit_index.config)
+				{
+					Ok(true) => return SubmitResult::KnownExpired,
+					Ok(false) => {},
+					Err(e) => return SubmitResult::InternalError(e),
+				}
+			}
+
 			let statement_len = statement.data_len();
 			// The account record is materialised only when the constraint check actually needs
 			// it: a channel-less statement from an account whose cached summary shows headroom
@@ -2773,6 +2930,14 @@ impl StatementStore for Store {
 
 			// Build the whole admission as one atomic commit
 			let mut commit = Vec::new();
+			if let Some(value) = &previous_ban {
+				let ban = match Eviction::decode(value, submit_index.config.purge_after_sec) {
+					Ok(ban) => ban,
+					Err(e) => return SubmitResult::InternalError(e),
+				};
+				commit.push((col::EXPIRED, hash.to_vec(), None));
+				commit.push((col::INDEX_EVICTED, evicted_index_key(ban.purge_at, &hash), None));
+			}
 			commit.push((col::STATEMENTS, hash.to_vec(), Some(statement.encode())));
 			commit.push((col::ADMISSION_SEQ, plan.seq.to_be_bytes().to_vec(), Some(hash.to_vec())));
 			commit.extend(statement_index_ops(&hash, &statement, true));
@@ -2826,13 +2991,16 @@ impl StatementStore for Store {
 					),
 				}
 			}
+			let mut replaced_bans = 0;
 			for (h, purge_at) in &plan.banned {
-				commit.push((col::EXPIRED, h.to_vec(), Some((h, current_time).encode())));
-				commit.push((
-					col::INDEX_EVICTED,
-					evicted_index_key(*purge_at, h),
-					Some(INDEX_EMPTY_VALUE.to_vec()),
-				));
+				match self.db.get_size(col::EXPIRED, h) {
+					Ok(Some(_)) => replaced_bans += 1,
+					Ok(None) => {},
+					Err(e) => return SubmitResult::InternalError(Error::Db(e.to_string())),
+				}
+				let value = Eviction::encode(h, current_time, *purge_at, false);
+				commit.push((col::EXPIRED, h.to_vec(), Some(value.clone())));
+				commit.push((col::INDEX_EVICTED, evicted_index_key(*purge_at, h), Some(value)));
 			}
 			let freed: usize = plan.evicted.iter().map(|(_, details)| details.data_len).sum();
 			commit.push(SubmitIndex::counters_op(
@@ -2855,6 +3023,7 @@ impl StatementStore for Store {
 			}
 			let seq = plan.seq;
 			submit_index.apply_insert(&account_id, loaded_record, hash, &statement, &plan);
+			submit_index.evicted_count -= replaced_bans + usize::from(previous_ban.is_some());
 			// The query-index bookkeeping is applied under the same lock that ordered the
 			// commit: a concurrent removal racing a resubmission of the same statement can then
 			// never apply its stale update on top of this newer one (#12624). The notification
@@ -2878,7 +3047,7 @@ impl StatementStore for Store {
 	/// it in the `EXPIRED` column so it cannot be re-accepted until its purge period elapses (see
 	/// [`maintain`](Self::maintain)). No-op if the statement is unknown.
 	fn remove(&self, hash: &Hash) -> Result<()> {
-		self.remove_statement(hash).map(|_| ())
+		self.remove_statement(hash, true).map(|_| ())
 	}
 
 	/// Remove every statement authored by `who`, applying the same soft-delete as
@@ -2920,14 +3089,21 @@ impl StatementStore for Store {
 					commit.push((
 						col::EXPIRED,
 						key.hash.to_vec(),
-						Some((key.hash, current_time).encode()),
+						Some(Eviction::encode(&key.hash, current_time, purge_at, true)),
 					));
 					commit.push((
 						col::INDEX_EVICTED,
 						evicted_index_key(purge_at, &key.hash),
-						Some(INDEX_EMPTY_VALUE.to_vec()),
+						Some(Eviction::encode(&key.hash, current_time, purge_at, true)),
 					));
-					banned_count += 1;
+					if self
+						.db
+						.get_size(col::EXPIRED, &key.hash)
+						.map_err(|e| Error::Db(e.to_string()))?
+						.is_none()
+					{
+						banned_count += 1;
+					}
 				}
 				freed_size += details.data_len;
 				match self.db.get(col::STATEMENTS, &key.hash) {
@@ -3055,7 +3231,7 @@ impl Store {
 	/// `Ok(false)` means no (decodable) statement is stored under `hash` — it was already gone,
 	/// or its body is corrupt. A corrupt body cannot be tied back to its index rows, so nothing
 	/// is removed at all.
-	fn remove_statement(&self, hash: &Hash) -> Result<bool> {
+	fn remove_statement(&self, hash: &Hash, explicit: bool) -> Result<bool> {
 		let current_time = self.timestamp();
 		{
 			let mut submit_index = self.submit_index.write();
@@ -3099,17 +3275,17 @@ impl Store {
 					HexDisplay::from(hash)
 				),
 			}
-			let banned = current_time < expiry.get_expiration_timestamp_secs();
+			let banned = current_time < expiry.get_expiration_timestamp_secs() &&
+				(explicit || submit_index.config.full_replication.is_none());
+			let previous_ban =
+				self.db.get(col::EXPIRED, hash).map_err(|e| Error::Db(e.to_string()))?;
 			if banned {
 				let purge_at = expiry
 					.get_expiration_timestamp_secs()
 					.min(current_time.saturating_add(submit_index.config.purge_after_sec));
-				commit.push((col::EXPIRED, hash.to_vec(), Some((hash, current_time).encode())));
-				commit.push((
-					col::INDEX_EVICTED,
-					evicted_index_key(purge_at, hash),
-					Some(INDEX_EMPTY_VALUE.to_vec()),
-				));
+				let value = Eviction::encode(hash, current_time, purge_at, explicit);
+				commit.push((col::EXPIRED, hash.to_vec(), Some(value.clone())));
+				commit.push((col::INDEX_EVICTED, evicted_index_key(purge_at, hash), Some(value)));
 			}
 			let data_len = details
 				.as_ref()
@@ -3132,7 +3308,7 @@ impl Store {
 				&account,
 				&PriorityKey { hash: *hash, expiry },
 				data_len,
-				banned,
+				banned && previous_ban.is_none(),
 			);
 			self.query_index.write().note_remove(hash, &statement);
 			log::trace!(target: LOG_TARGET, "Expired statement {:?}", HexDisplay::from(hash));
@@ -3310,6 +3486,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+	mod full_replication;
 
 	use crate::{col, AllowanceBlock, Store, KEY_VERSION};
 	use sc_keystore::Keystore;
