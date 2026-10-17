@@ -83,6 +83,10 @@
 //! `config::INITIAL_SYNC_RESERVED_BYTES` early: refills reclaim freed bytes synchronously,
 //! while the timer-driven sync bursts would otherwise always find the budget full.
 //!
+//! Each peer carries an outgoing mirror of its statement-rate quota. Live propagation charges
+//! that quota per chunk, and initial replay draws from it per statement. An exhausted replay
+//! quota preserves the admission cursor and yields to other peers until it refills.
+//!
 //! ## Topic affinity and light nodes
 //!
 //! The `statement/2` protocol lets a peer advertise which topics it cares about as a bloom filter
@@ -757,6 +761,8 @@ impl PeerRateLimiter {
 pub struct Peer {
 	/// Rate limiter for statement flooding protection.
 	rate_limiter: PeerRateLimiter,
+	/// Outgoing quota shared by live propagation and paced admission replay.
+	send_budget: PeerRateLimiter,
 	/// Protocol version negotiated with this peer.
 	protocol_version: PeerProtocolVersion,
 	/// Topic affinity filter received from a v2 peer.
@@ -891,6 +897,10 @@ fn fetch_admitted_chunk(
 			if accumulated_size > 0 && accumulated_size + encoded.len() > max_size {
 				return FilterDecision::Abort;
 			}
+			// Preserve the cursor when the peer's outgoing quota is exhausted.
+			if peer_data.send_budget.is_flooding(1) {
+				return FilterDecision::Abort;
+			}
 			accumulated_size += encoded.len();
 			FilterDecision::Take
 		},
@@ -963,6 +973,7 @@ impl Peer {
 	pub fn new_for_testing(statements_per_second: NonZeroU32, burst: NonZeroU32) -> Self {
 		Self {
 			rate_limiter: PeerRateLimiter::new(statements_per_second, burst),
+			send_budget: PeerRateLimiter::new(statements_per_second, burst),
 			protocol_version: PeerProtocolVersion::V1,
 			topic_affinity: None,
 			is_light: false,
@@ -1306,6 +1317,14 @@ where
 					peer,
 					Peer {
 						rate_limiter: PeerRateLimiter::new(
+							self.statements_per_second,
+							NonZeroU32::new(
+								self.statements_per_second.get() *
+									config::STATEMENTS_BURST_COEFFICIENT,
+							)
+							.expect("burst capacity is nonzero"),
+						),
+						send_budget: PeerRateLimiter::new(
 							self.statements_per_second,
 							NonZeroU32::new(
 								self.statements_per_second.get() *
@@ -1773,6 +1792,10 @@ where
 				self.propagation_outboxes.remove(&who);
 				return;
 			};
+			// Live propagation keeps priority; replay uses the quota left over.
+			if let Some(peer) = self.peers.get(&who) {
+				peer.send_budget.is_flooding(statement_count);
+			}
 			let chunk_id = self.occupy_send_slot(who);
 			let in_flight = self.propagation_in_flight_bytes.saturating_add(bytes_sent);
 			self.set_propagation_in_flight_bytes(in_flight);
@@ -2821,6 +2844,14 @@ mod tests {
 						)
 						.expect("burst capacity is nonzero"),
 					),
+					send_budget: PeerRateLimiter::new(
+						NonZeroU32::new(DEFAULT_STATEMENTS_PER_SECOND)
+							.expect("DEFAULT_STATEMENTS_PER_SECOND is nonzero"),
+						NonZeroU32::new(
+							DEFAULT_STATEMENTS_PER_SECOND * config::STATEMENTS_BURST_COEFFICIENT,
+						)
+						.expect("burst capacity is nonzero"),
+					),
 					protocol_version: PeerProtocolVersion::V1,
 					topic_affinity: None,
 					is_light: false,
@@ -3649,6 +3680,57 @@ mod tests {
 			sync_recovery_readd_timeout: Box::pin(futures::future::pending()),
 		};
 		(handler, statement_store, network, notification_service)
+	}
+
+	#[tokio::test]
+	async fn initial_sync_waits_for_quota_without_blocking_other_peers() {
+		let (mut handler, store, _, notifications, _, peers) = build_handler(2);
+		let clock = FakeRelativeClock::default();
+		handler.peers.get_mut(&peers[0]).unwrap().send_budget = PeerRateLimiter::with_clock(
+			NonZeroU32::new(1).unwrap(),
+			NonZeroU32::new(10).unwrap(),
+			&clock,
+		);
+		let mut hashes = Vec::new();
+		for i in 0..20u8 {
+			let mut statement = new_live_statement();
+			statement.set_plain_data(vec![i]);
+			hashes.push(statement.hash());
+			store.insert(statement);
+		}
+		for peer in &peers {
+			handler.schedule_initial_sync_for_peer(*peer);
+		}
+		// A live chunk consumes the same quota that replay draws from.
+		handler
+			.propagation_outboxes
+			.insert(peers[0], hashes[..10].iter().copied().collect());
+		handler.try_send_next_chunk(peers[0]);
+		handler.flush_pending_sends().await;
+		assert_eq!(
+			get_peer_hashes(&notifications.get_sent_notifications(), peers[0]),
+			hashes[..10]
+		);
+		notifications.clear_sent_notifications();
+		for _ in 0..2 {
+			handler.process_initial_sync_burst();
+			handler.flush_pending_sends().await;
+		}
+		assert!(get_peer_hashes(&notifications.get_sent_notifications(), peers[0]).is_empty());
+		assert_eq!(get_peer_hashes(&notifications.get_sent_notifications(), peers[1]), hashes);
+		assert_eq!(handler.pending_initial_syncs[&peers[0]].cursor, 0);
+		// Refills resume the saved cursor, including a second quota boundary.
+		for expected in [10, 20] {
+			clock.advance(Duration::from_secs(10));
+			for _ in 0..2 {
+				handler.process_initial_sync_burst();
+				handler.flush_pending_sends().await;
+			}
+			assert_eq!(
+				get_peer_hashes(&notifications.get_sent_notifications(), peers[0]),
+				hashes[..expected],
+			);
+		}
 	}
 
 	#[tokio::test]
@@ -5606,6 +5688,13 @@ mod tests {
 					)
 					.expect("nonzero"),
 				),
+				send_budget: PeerRateLimiter::new(
+					NonZeroU32::new(DEFAULT_STATEMENTS_PER_SECOND).expect("nonzero"),
+					NonZeroU32::new(
+						DEFAULT_STATEMENTS_PER_SECOND * config::STATEMENTS_BURST_COEFFICIENT,
+					)
+					.expect("nonzero"),
+				),
 				protocol_version: version,
 				topic_affinity,
 				is_light,
@@ -5861,6 +5950,13 @@ mod tests {
 			peer_id,
 			Peer {
 				rate_limiter: PeerRateLimiter::new(
+					NonZeroU32::new(DEFAULT_STATEMENTS_PER_SECOND).unwrap(),
+					NonZeroU32::new(
+						DEFAULT_STATEMENTS_PER_SECOND * config::STATEMENTS_BURST_COEFFICIENT,
+					)
+					.unwrap(),
+				),
+				send_budget: PeerRateLimiter::new(
 					NonZeroU32::new(DEFAULT_STATEMENTS_PER_SECOND).unwrap(),
 					NonZeroU32::new(
 						DEFAULT_STATEMENTS_PER_SECOND * config::STATEMENTS_BURST_COEFFICIENT,
@@ -6410,6 +6506,14 @@ mod tests {
 					)
 					.expect("burst capacity is nonzero"),
 				),
+				send_budget: PeerRateLimiter::new(
+					NonZeroU32::new(DEFAULT_STATEMENTS_PER_SECOND)
+						.expect("DEFAULT_STATEMENTS_PER_SECOND is nonzero"),
+					NonZeroU32::new(
+						DEFAULT_STATEMENTS_PER_SECOND * config::STATEMENTS_BURST_COEFFICIENT,
+					)
+					.expect("burst capacity is nonzero"),
+				),
 				protocol_version: PeerProtocolVersion::V1,
 				topic_affinity: None,
 				is_light: false,
@@ -6514,6 +6618,14 @@ mod tests {
 				)
 				.expect("burst capacity is nonzero"),
 			),
+			send_budget: PeerRateLimiter::new(
+				NonZeroU32::new(DEFAULT_STATEMENTS_PER_SECOND)
+					.expect("DEFAULT_STATEMENTS_PER_SECOND is nonzero"),
+				NonZeroU32::new(
+					DEFAULT_STATEMENTS_PER_SECOND * config::STATEMENTS_BURST_COEFFICIENT,
+				)
+				.expect("burst capacity is nonzero"),
+			),
 			protocol_version: PeerProtocolVersion::V1,
 			topic_affinity: None,
 			is_light: false,
@@ -6598,6 +6710,14 @@ mod tests {
 
 		let peer = Peer {
 			rate_limiter: PeerRateLimiter::new(
+				NonZeroU32::new(DEFAULT_STATEMENTS_PER_SECOND)
+					.expect("DEFAULT_STATEMENTS_PER_SECOND is nonzero"),
+				NonZeroU32::new(
+					DEFAULT_STATEMENTS_PER_SECOND * config::STATEMENTS_BURST_COEFFICIENT,
+				)
+				.expect("burst capacity is nonzero"),
+			),
+			send_budget: PeerRateLimiter::new(
 				NonZeroU32::new(DEFAULT_STATEMENTS_PER_SECOND)
 					.expect("DEFAULT_STATEMENTS_PER_SECOND is nonzero"),
 				NonZeroU32::new(
