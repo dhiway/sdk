@@ -26,6 +26,35 @@ pub(crate) const PROPAGATE_TIMEOUT: time::Duration = time::Duration::from_millis
 /// Maximum allowed size for a statement notification.
 pub const MAX_STATEMENT_NOTIFICATION_SIZE: u64 = 1024 * 1024;
 
+/// Encoded Statement ceiling for full replicas, reserving the stricter V2 envelope.
+pub const FULL_REPLICATION_MAX_STATEMENT_SIZE: usize = MAX_STATEMENT_NOTIFICATION_SIZE as usize - 6;
+
+/// Opt-in replication of the complete retained feed between full peers.
+///
+/// Every participant must use compatible admission, retention and capacity policies.
+/// A completed replay confirms local sends, not remote admission or network consensus.
+#[derive(Debug, Clone, Copy)]
+pub struct FullReplication {
+	/// Minimum delay after a peer's completed replay before starting another pass.
+	pub repair_interval: time::Duration,
+}
+
+impl FullReplication {
+	/// Reject a zero delay, which would continuously rescan and retransmit the store.
+	pub fn validate(&self) -> Result<(), &'static str> {
+		if self.repair_interval.is_zero() {
+			return Err("full replication repair_interval must be greater than zero");
+		}
+		Ok(())
+	}
+}
+
+impl Default for FullReplication {
+	fn default() -> Self {
+		Self { repair_interval: time::Duration::from_secs(300) }
+	}
+}
+
 /// Minimum wire size of a valid statement: field-count prefix, `AuthenticityProof` and `Expiry`.
 pub const MIN_ENCODED_STATEMENT_SIZE: usize = 108;
 
