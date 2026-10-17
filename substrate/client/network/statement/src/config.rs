@@ -45,6 +45,9 @@ impl FullReplication {
 		if self.repair_interval.is_zero() {
 			return Err("full replication repair_interval must be greater than zero");
 		}
+		if time::Instant::now().checked_add(self.repair_interval).is_none() {
+			return Err("full replication repair_interval exceeds the monotonic clock range");
+		}
 		Ok(())
 	}
 }
