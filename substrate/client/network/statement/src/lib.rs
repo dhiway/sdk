@@ -87,6 +87,12 @@
 //! that quota per chunk, and initial replay draws from it per statement. An exhausted replay
 //! quota preserves the admission cursor and yields to other peers until it refills.
 //!
+//! With [`config::FullReplication`] enabled, full peers receive periodic complete-feed replay.
+//! Each finite pass retains its cursor through retries and rate exhaustion. The interval starts
+//! after completion; due work cannot replace an active pass. Live and replay chunks alternate
+//! under one outgoing quota and the existing byte reserve. Full-peer policy rejections are
+//! reputation-neutral. A completed pass confirms local sends, never remote Store admission.
+//!
 //! ## Topic affinity and light nodes
 //!
 //! The `statement/2` protocol lets a peer advertise which topics it cares about as a bloom filter
@@ -270,6 +276,7 @@ struct Metrics {
 	propagation_in_flight_bytes: Gauge<U64>,
 	initial_sync_peers_active: Gauge<U64>,
 	initial_sync_duration_seconds: HistogramVec,
+	full_replication_oldest_replay_seconds: Gauge<U64>,
 	statement_flooding_detected: Counter<U64>,
 	send_failures: CounterVec<U64>,
 	undelivered_statements: CounterVec<U64>,
@@ -287,7 +294,7 @@ mod send_failure {
 }
 
 mod sync_outcome {
-	/// A burst found the backlog drained, so every statement reached the peer.
+	/// A burst found the backlog drained; the local network layer accepted all sends.
 	pub const COMPLETED: &str = "completed";
 	/// The sync ended before its backlog was drained.
 	pub const ABANDONED: &str = "abandoned";
@@ -435,6 +442,10 @@ impl Metrics {
 				)?,
 				r,
 			)?,
+			full_replication_oldest_replay_seconds: register(
+				Gauge::new("substrate_sync_full_replication_oldest_replay_seconds",
+					"Age of the oldest active full-peer replay; completion is local send progress")?, r,
+			)?,
 			statement_flooding_detected: register(
 				Counter::new(
 					"substrate_sync_statement_flooding_detected",
@@ -468,6 +479,7 @@ impl Metrics {
 
 /// Prototype for a [`StatementHandler`].
 pub struct StatementHandlerPrototype {
+	full_replication: Option<FullReplication>,
 	protocol_name: ProtocolName,
 	notification_service: Box<dyn NotificationService>,
 }
@@ -509,7 +521,20 @@ impl StatementHandlerPrototype {
 			peer_store_handle,
 		);
 
-		(Self { protocol_name: protocol_name.into(), notification_service }, config)
+		(
+			Self {
+				protocol_name: protocol_name.into(),
+				notification_service,
+				full_replication: None,
+			},
+			config,
+		)
+	}
+
+	/// Configure complete-feed replication with the same option used by the Store.
+	pub fn with_full_replication(mut self, config: Option<FullReplication>) -> Self {
+		self.full_replication = config;
+		self
 	}
 
 	/// Turns the prototype into the actual handler.
@@ -529,6 +554,18 @@ impl StatementHandlerPrototype {
 		mut num_submission_workers: usize,
 		statements_per_second: u32,
 	) -> error::Result<StatementHandler<N, S>> {
+		if let Some(config) = self.full_replication {
+			config
+				.validate()
+				.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+		}
+		if statements_per_second.checked_mul(STATEMENTS_BURST_COEFFICIENT).is_none() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"statement rate_limit overflows the burst capacity",
+			)
+			.into());
+		}
 		let sync_event_stream = sync.event_stream("statement-handler-sync");
 		// Still bounded via the `MAX_PENDING_STATEMENTS` check in `on_statements`.
 		let (queue_sender, queue_receiver) = async_channel::unbounded();
@@ -585,6 +622,8 @@ impl StatementHandlerPrototype {
 
 		let handler = StatementHandler {
 			protocol_name: self.protocol_name,
+			full_replication: self.full_replication,
+			full_replication_service_at: Instant::now(),
 			notification_service: self.notification_service,
 			propagate_timeout: (Box::pin(interval(PROPAGATE_TIMEOUT))
 				as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -629,6 +668,8 @@ pub struct StatementHandler<
 	N: NetworkPeers + NetworkEventStream,
 	S: SyncEventStream + sp_consensus::SyncOracle,
 > {
+	full_replication: Option<FullReplication>,
+	full_replication_service_at: Instant,
 	protocol_name: ProtocolName,
 	/// Interval at which we call `propagate_statements`.
 	propagate_timeout: stream::Fuse<Pin<Box<dyn Stream<Item = ()> + Send>>>,
@@ -763,6 +804,12 @@ pub struct Peer {
 	rate_limiter: PeerRateLimiter,
 	/// Outgoing quota shared by live propagation and paced admission replay.
 	send_budget: PeerRateLimiter,
+	/// Full replicas ignore topic affinity and receive periodic native replay.
+	full_replica: bool,
+	/// A live chunk yields the next eligible send slot to replay.
+	replay_turn: bool,
+	/// Earliest next pass after completion (or retry after a watermark error).
+	next_repair_at: Instant,
 	/// Protocol version negotiated with this peer.
 	protocol_version: PeerProtocolVersion,
 	/// Topic affinity filter received from a v2 peer.
@@ -886,7 +933,7 @@ fn fetch_admitted_chunk(
 			if stmt.is_expired(now) {
 				return FilterDecision::Skip;
 			}
-			if peer_data.topic_affinity.as_ref().is_some_and(|a| !a.matches_statement(stmt)) {
+			if !peer_data.matches_statement(stmt) {
 				return FilterDecision::Skip;
 			}
 			// The peer supplied this statement, do not send it back.
@@ -926,7 +973,7 @@ fn fetch_statement_chunk(
 			if stmt.is_expired(now) {
 				return FilterDecision::Skip;
 			}
-			if peer_data.topic_affinity.as_ref().is_some_and(|a| !a.matches_statement(stmt)) {
+			if !peer_data.matches_statement(stmt) {
 				return FilterDecision::Skip;
 			}
 			// The peer supplied this statement, do not send it back.
@@ -935,6 +982,9 @@ fn fetch_statement_chunk(
 				return FilterDecision::Skip;
 			}
 			if accumulated_size > 0 && accumulated_size + encoded.len() > max_size {
+				return FilterDecision::Abort;
+			}
+			if peer_data.full_replica && peer_data.send_budget.is_flooding(1) {
 				return FilterDecision::Abort;
 			}
 			accumulated_size += encoded.len();
@@ -979,7 +1029,15 @@ impl Peer {
 			is_light: false,
 			pending_topic_affinity: None,
 			sync_watermark: 0,
+			full_replica: false,
+			replay_turn: false,
+			next_repair_at: Instant::now(),
 		}
+	}
+
+	fn matches_statement(&self, statement: &Statement) -> bool {
+		self.full_replica ||
+			self.topic_affinity.as_ref().is_none_or(|a| a.matches_statement(statement))
 	}
 
 	/// Whether this peer is ready to receive statements.
@@ -1021,6 +1079,8 @@ where
 	) -> Self {
 		Self {
 			protocol_name,
+			full_replication: None,
+			full_replication_service_at: Instant::now(),
 			notification_service,
 			propagate_timeout,
 			pending_statements: FuturesUnordered::new(),
@@ -1066,6 +1126,7 @@ where
 	/// interrupted.
 	pub async fn run(mut self) {
 		loop {
+			self.service_full_replication(Instant::now());
 			futures::select_biased! {
 				send_result = self.pending_sends.select_next_some() => {
 					self.handle_send_result(send_result);
@@ -1097,7 +1158,7 @@ where
 					}
 				}
 				_ = &mut self.initial_sync_timeout => {
-					self.process_initial_sync_burst();
+					if self.full_replication.is_none() { self.process_initial_sync_burst(); }
 					self.initial_sync_timeout =
 						Box::pin(tokio::time::sleep(INITIAL_SYNC_BURST_INTERVAL).fuse());
 				},
@@ -1117,6 +1178,42 @@ where
 				self.start_sync_recovery();
 			}
 		}
+	}
+
+	/// Bounded wall-clock servicing cannot be starved by ready notifications or completions.
+	fn service_full_replication(&mut self, now: Instant) {
+		if self.full_replication.is_none() || now < self.full_replication_service_at {
+			return;
+		}
+		self.full_replication_service_at = now + INITIAL_SYNC_BURST_INTERVAL;
+		if self.sync.is_major_syncing() {
+			return;
+		}
+		let due: Vec<_> = self
+			.peers
+			.iter()
+			.filter_map(|(id, peer)| {
+				(peer.full_replica &&
+					now >= peer.next_repair_at &&
+					!self.pending_initial_syncs.contains_key(id))
+				.then_some(*id)
+			})
+			.collect();
+		for peer in due {
+			self.schedule_initial_sync_for_peer(peer);
+		}
+		if let Some(metrics) = &self.metrics {
+			let oldest = self
+				.pending_initial_syncs
+				.iter()
+				.filter(|(peer, _)| self.peers.get(peer).is_some_and(|p| p.full_replica))
+				.map(|(_, pending)| now.saturating_duration_since(pending.started_at).as_secs())
+				.max()
+				.unwrap_or(0);
+			metrics.full_replication_oldest_replay_seconds.set(oldest);
+		}
+		self.process_initial_sync_burst();
+		self.fill_parked_propagations();
 	}
 
 	/// Release excess map capacity once the map is less than a quarter full.
@@ -1210,7 +1307,9 @@ where
 
 	/// Re-adds the sync-recovery peer to the reserved set after the backoff window has elapsed
 	fn try_readd_sync_recovery_peer(&mut self) {
-		let Some(peer_id) = self.sync_recovery_peer.take() else { return };
+		let Some(peer_id) = self.sync_recovery_peer.take() else {
+			return;
+		};
 		log::trace!(
 			target: LOG_TARGET,
 			"Re-adding {peer_id} to reserved set after sync recovery window",
@@ -1337,9 +1436,14 @@ where
 						is_light,
 						pending_topic_affinity: None,
 						sync_watermark: 0,
+						full_replica: false,
+						replay_turn: false,
+						next_repair_at: Instant::now(),
 					},
 				);
 				debug_assert!(_was_in.is_none());
+				self.peers.get_mut(&peer).expect("just inserted").full_replica =
+					self.full_replication.is_some() && !is_light;
 
 				self.metrics.as_ref().map(|metrics| {
 					if let Some(peer) = self.peers.get(&peer) {
@@ -1418,6 +1522,10 @@ where
 								},
 								StatementMessage::ExplicitTopicAffinity(filter) => {
 									if let Some(peer_data) = self.peers.get_mut(&peer) {
+										if peer_data.full_replica {
+											// Full peers always receive the complete feed.
+											return;
+										}
 										if peer_data.rate_limiter.is_flooding(1) {
 											log::debug!(
 												target: LOG_TARGET,
@@ -1526,19 +1634,25 @@ where
 					// store insert.
 					if let Some(peers) = self.pending_statements_peers.get_mut(&hash) {
 						if peers.insert(who) {
-							self.network.report_peer(who, rep::ANY_STATEMENT);
+							if !peer.full_replica {
+								self.network.report_peer(who, rep::ANY_STATEMENT);
+							}
 						} else {
 							log::trace!(
 								target: LOG_TARGET,
 								"Already received the statement from the same peer {who}.",
 							);
-							self.network.report_peer(who, rep::DUPLICATE_STATEMENT);
+							if !peer.full_replica {
+								self.network.report_peer(who, rep::DUPLICATE_STATEMENT);
+							}
 						}
 					}
 					continue;
 				}
 
-				self.network.report_peer(who, rep::ANY_STATEMENT);
+				if !peer.full_replica {
+					self.network.report_peer(who, rep::ANY_STATEMENT);
+				}
 
 				match self.pending_statements_peers.entry(hash) {
 					Entry::Vacant(entry) => {
@@ -1571,7 +1685,9 @@ where
 					Entry::Occupied(mut entry) => {
 						if !entry.get_mut().insert(who) {
 							// Already received this from the same peer.
-							self.network.report_peer(who, rep::DUPLICATE_STATEMENT);
+							if !peer.full_replica {
+								self.network.report_peer(who, rep::DUPLICATE_STATEMENT);
+							}
 						}
 					},
 				}
@@ -1596,6 +1712,17 @@ where
 	/// - `KnownExpired`, `Rejected`, `InternalError` → no follow-up change, so the peer keeps the
 	///   initial `rep::ANY_STATEMENT` charge.
 	fn on_handle_statement_import(&mut self, who: PeerId, import: &SubmitResult) {
+		// Repair repeatedly offers records that another full node can legitimately reject.
+		// Full peers are charged for malformed proofs and flooding, not local policy differences.
+		if self.peers.get(&who).is_some_and(|peer| peer.full_replica) {
+			match import {
+				SubmitResult::New => self.network.report_peer(who, rep::GOOD_STATEMENT),
+				SubmitResult::Invalid(sp_statement_store::InvalidReason::AlreadyExpired) => {},
+				SubmitResult::Invalid(_) => self.network.report_peer(who, rep::INVALID_STATEMENT),
+				_ => {},
+			}
+			return;
+		}
 		match import {
 			SubmitResult::New => self.network.report_peer(who, rep::GOOD_STATEMENT),
 			SubmitResult::Known => self.network.report_peer(who, rep::ANY_STATEMENT_REFUND),
@@ -1657,7 +1784,7 @@ where
 				return None;
 			}
 			// For v2 peers with topic affinity, filter by topic match.
-			if peer.topic_affinity.as_ref().is_some_and(|a| !a.matches_statement(stmt)) {
+			if !peer.matches_statement(stmt) {
 				return None;
 			}
 			Some(*hash)
@@ -1691,6 +1818,11 @@ where
 	/// slow peer holds one encoded chunk, not its whole backlog. Hashes whose statements left
 	/// the store since they were queued are dropped.
 	fn try_send_next_chunk(&mut self, who: PeerId) {
+		if self.peers.get(&who).is_some_and(|p| p.full_replica && p.replay_turn) &&
+			self.pending_initial_syncs.contains_key(&who)
+		{
+			return;
+		}
 		if self.in_flight_chunks.contains_key(&who) {
 			return;
 		}
@@ -1748,11 +1880,11 @@ where
 				},
 			};
 
-			debug_assert!(
-				processed > 0,
-				"a fetch from a non-empty outbox consumes at least one hash"
-			);
 			if processed == 0 {
+				// No outgoing token yet. Keep every hash and retry on the next tick.
+				if !self.parked_propagations.contains(&who) {
+					self.parked_propagations.push_back(who);
+				}
 				return;
 			}
 
@@ -1793,8 +1925,11 @@ where
 				return;
 			};
 			// Live propagation keeps priority; replay uses the quota left over.
-			if let Some(peer) = self.peers.get(&who) {
-				peer.send_budget.is_flooding(statement_count);
+			if let Some(peer) = self.peers.get_mut(&who) {
+				if !peer.full_replica {
+					peer.send_budget.is_flooding(statement_count);
+				}
+				peer.replay_turn = true;
 			}
 			let chunk_id = self.occupy_send_slot(who);
 			let in_flight = self.propagation_in_flight_bytes.saturating_add(bytes_sent);
@@ -1895,7 +2030,9 @@ where
 			self.in_flight_chunks.remove(&peer);
 		}
 
-		let SendKind::InitialSync { sync_id, next_cursor } = kind else { return slot_freed };
+		let SendKind::InitialSync { sync_id, next_cursor } = kind else {
+			return slot_freed;
+		};
 
 		// A peer that reconnects inside the send timeout loses its sync on disconnect and gets a
 		// fresh one under the same `PeerId`; a stale result would advance or abort the wrong sync.
@@ -1950,7 +2087,9 @@ where
 		// parked peers are also refilled on the tick.
 		self.fill_parked_propagations();
 
-		let Ok(statements) = self.statement_store.take_recent_statements() else { return };
+		let Ok(statements) = self.statement_store.take_recent_statements() else {
+			return;
+		};
 		if !statements.is_empty() {
 			self.do_propagate_statements(&statements);
 		}
@@ -1966,6 +2105,12 @@ where
 	/// affinity changes (so that newly-matching statements get sent).
 	/// If the peer already has a pending initial sync, it is replaced.
 	fn schedule_initial_sync_for_peer(&mut self, peer: PeerId) {
+		if let (Some(config), Some(peer_data)) = (self.full_replication, self.peers.get_mut(&peer))
+		{
+			if peer_data.full_replica {
+				peer_data.next_repair_at = Instant::now() + config.repair_interval;
+			}
+		}
 		// A peer absent from the map has no entry to mirror the sync's watermark into.
 		if !self.peers.contains_key(&peer) {
 			return;
@@ -2079,7 +2224,9 @@ where
 			if self.send_in_flight_bytes() >= self.propagation_send_budget() {
 				return;
 			}
-			let Some(peer) = self.parked_propagations.pop_front() else { return };
+			let Some(peer) = self.parked_propagations.pop_front() else {
+				return;
+			};
 			self.try_send_next_chunk(peer);
 		}
 	}
@@ -2145,6 +2292,13 @@ where
 			let started_at = entry.get().started_at;
 			entry.remove();
 			self.record_initial_sync_completion(sync_outcome::COMPLETED, started_at);
+			if let (Some(config), Some(peer)) =
+				(self.full_replication, self.peers.get_mut(&peer_id))
+			{
+				peer.next_repair_at = Instant::now() + config.repair_interval;
+				peer.replay_turn = false;
+			}
+			self.try_send_next_chunk(peer_id);
 			return;
 		}
 
@@ -2156,6 +2310,14 @@ where
 			self.record_initial_sync_completion(sync_outcome::ABANDONED, pending.started_at);
 			return;
 		};
+		if peer_data.full_replica &&
+			!peer_data.replay_turn &&
+			self.propagation_outboxes.get(&peer_id).is_some_and(|q| !q.is_empty())
+		{
+			self.initial_sync_peer_queue.push_back(peer_id);
+			self.try_send_next_chunk(peer_id);
+			return;
+		}
 		let peer_version = peer_data.protocol_version;
 		let envelope_overhead = peer_version.envelope_overhead();
 		let max_size = max_statement_payload_size(envelope_overhead);
@@ -2226,6 +2388,9 @@ where
 			self.metrics.as_ref().map(|metrics| metrics.sent_latency_seconds.clone());
 		let in_flight = self.initial_sync_in_flight_bytes.saturating_add(bytes_to_send);
 		self.set_initial_sync_in_flight_bytes(in_flight);
+		if let Some(peer) = self.peers.get_mut(&peer_id) {
+			peer.replay_turn = false;
+		}
 		let chunk_id = self.occupy_send_slot(peer_id);
 		self.pending_sends.push(Box::pin(async move {
 			let sent_latency_timer = sent_latency.map(|metric| metric.start_timer());
@@ -2721,7 +2886,9 @@ mod tests {
 					break;
 				}
 				scanned += 1;
-				let Some(hash) = admissions.get(cursor as usize) else { break };
+				let Some(hash) = admissions.get(cursor as usize) else {
+					break;
+				};
 				// A journal entry whose statement left the store is a dead sequence number.
 				let Some(statement) = statements.get(hash) else {
 					cursor += 1;
@@ -2857,12 +3024,17 @@ mod tests {
 					is_light: false,
 					pending_topic_affinity: None,
 					sync_watermark: 0,
+					full_replica: false,
+					replay_turn: false,
+					next_repair_at: Instant::now(),
 				},
 			);
 		}
 
 		let handler = StatementHandler {
 			protocol_name: format!("/{STATEMENT_PROTOCOL_V1}").into(),
+			full_replication: None,
+			full_replication_service_at: Instant::now(),
 			notification_service: Box::new(notification_service.clone()),
 			propagate_timeout: (Box::pin(futures::stream::pending())
 				as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -3592,6 +3764,8 @@ mod tests {
 
 		let handler = StatementHandler {
 			protocol_name: format!("/{STATEMENT_PROTOCOL_V1}").into(),
+			full_replication: None,
+			full_replication_service_at: Instant::now(),
 			notification_service: Box::new(notification_service.clone()),
 			propagate_timeout: (Box::pin(futures::stream::pending())
 				as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -3644,6 +3818,8 @@ mod tests {
 
 		let handler = StatementHandler {
 			protocol_name: format!("/{STATEMENT_PROTOCOL_V1}").into(),
+			full_replication: None,
+			full_replication_service_at: Instant::now(),
 			notification_service: Box::new(notification_service.clone()),
 			propagate_timeout: (Box::pin(futures::stream::pending())
 				as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -3680,6 +3856,282 @@ mod tests {
 			sync_recovery_readd_timeout: Box::pin(futures::future::pending()),
 		};
 		(handler, statement_store, network, notification_service)
+	}
+
+	fn enable_full_replication(handler: &mut StatementHandler<TestNetwork, TestSync>) {
+		handler.full_replication = Some(FullReplication::default());
+		for peer in handler.peers.values_mut() {
+			peer.full_replica = !peer.is_light;
+		}
+	}
+
+	#[tokio::test]
+	async fn full_replication_repairs_lost_live_send_without_reconnect() {
+		let (mut handler, store, _, notifications, _, peers) = build_handler(1);
+		enable_full_replication(&mut handler);
+		let mut statement = new_live_statement();
+		statement.set_plain_data(b"recover without reconnect".to_vec());
+		let hash = statement.hash();
+		store.insert(statement.clone());
+		notifications.fail_sends();
+		handler.do_propagate_statements(&[(0, hash, statement)]);
+		handler.flush_pending_sends().await;
+		assert!(notifications.get_sent_notifications().is_empty());
+		notifications.allow_sends();
+		handler.service_full_replication(Instant::now() + std::time::Duration::from_secs(301));
+		handler.flush_pending_sends().await;
+		assert_eq!(get_peer_hashes(&notifications.get_sent_notifications(), peers[0]), vec![hash]);
+	}
+
+	#[tokio::test]
+	async fn full_replication_preserves_slow_cursor_and_waits_after_completion() {
+		let (mut handler, store, _, notifications, _, peers) = build_handler(1);
+		enable_full_replication(&mut handler);
+		let peer = peers[0];
+		let clock = FakeRelativeClock::default();
+		handler.peers.get_mut(&peer).unwrap().send_budget = PeerRateLimiter::with_clock(
+			NonZeroU32::new(1).unwrap(),
+			NonZeroU32::new(1).unwrap(),
+			&clock,
+		);
+		let mut hashes = Vec::new();
+		for i in 0..3u8 {
+			let mut statement = new_live_statement();
+			statement.set_plain_data(vec![i]);
+			hashes.push(statement.hash());
+			store.insert(statement);
+		}
+		let start = Instant::now();
+		handler.service_full_replication(start);
+		handler.flush_pending_sends().await;
+		let id = handler.pending_initial_syncs[&peer].sync_id;
+		assert_eq!(handler.pending_initial_syncs[&peer].cursor, 1);
+		// Several elapsed intervals cannot restart a slow replay or skip the saved cursor.
+		handler.service_full_replication(start + std::time::Duration::from_secs(900));
+		assert_eq!(handler.pending_initial_syncs[&peer].sync_id, id);
+		assert_eq!(handler.pending_initial_syncs[&peer].cursor, 1);
+		for _ in 0..2 {
+			clock.advance(std::time::Duration::from_secs(1));
+			handler.process_initial_sync_burst();
+			handler.flush_pending_sends().await;
+		}
+		handler.process_initial_sync_burst();
+		assert!(!handler.pending_initial_syncs.contains_key(&peer));
+		assert!(handler.peers[&peer].next_repair_at > Instant::now());
+		assert_eq!(get_peer_hashes(&notifications.get_sent_notifications(), peer), hashes);
+	}
+
+	#[tokio::test]
+	async fn full_replication_live_and_replay_alternate_under_one_token_quota() {
+		let (mut handler, store, _, notifications, _, peers) = build_handler(1);
+		enable_full_replication(&mut handler);
+		let peer = peers[0];
+		let clock = FakeRelativeClock::default();
+		handler.peers.get_mut(&peer).unwrap().send_budget = PeerRateLimiter::with_clock(
+			NonZeroU32::new(1).unwrap(),
+			NonZeroU32::new(1).unwrap(),
+			&clock,
+		);
+		let mut hashes = Vec::new();
+		for i in 0..6u8 {
+			let mut statement = new_live_statement();
+			statement.set_plain_data(vec![i]);
+			hashes.push(statement.hash());
+			store.insert(statement);
+		}
+		handler.schedule_initial_sync_for_peer(peer);
+		handler.propagation_outboxes.insert(peer, hashes[3..].iter().copied().collect());
+		for _ in 0..6 {
+			handler.process_initial_sync_burst();
+			handler.flush_pending_sends().await;
+			clock.advance(std::time::Duration::from_secs(1));
+		}
+		let sent = get_peer_hashes(&notifications.get_sent_notifications(), peer);
+		assert_eq!(sent, vec![hashes[3], hashes[0], hashes[4], hashes[1], hashes[5], hashes[2]]);
+		assert_eq!(handler.pending_initial_syncs[&peer].cursor, 3);
+	}
+
+	#[tokio::test]
+	async fn full_replication_ignores_full_affinity_but_keeps_light_filter() {
+		let (mut handler, store, _, notifications, _, peers) = build_handler(2);
+		handler.peers.get_mut(&peers[1]).unwrap().is_light = true;
+		enable_full_replication(&mut handler);
+		for peer in handler.peers.values_mut() {
+			peer.topic_affinity = Some(AffinityFilter::new(BLOOM_SEED, 0.01, 10));
+		}
+		let mut statement = new_live_statement();
+		statement.set_plain_data(b"full feed".to_vec());
+		statement.set_topic(0, [3; 32].into());
+		let hash = statement.hash();
+		store.insert(statement.clone());
+		handler.do_propagate_statements(&[(0, hash, statement)]);
+		handler.flush_pending_sends().await;
+		assert_eq!(get_peer_hashes(&notifications.get_sent_notifications(), peers[0]), vec![hash]);
+		assert!(get_peer_hashes(&notifications.get_sent_notifications(), peers[1]).is_empty());
+		handler.peers.get_mut(&peers[0]).unwrap().protocol_version = PeerProtocolVersion::V2;
+		handler.schedule_initial_sync_for_peer(peers[0]);
+		let id = handler.pending_initial_syncs[&peers[0]].sync_id;
+		handler
+			.handle_notification_event(NotificationEvent::NotificationReceived {
+				peer: peers[0],
+				notification: StatementMessage::ExplicitTopicAffinity(AffinityFilter::new(
+					BLOOM_SEED, 0.01, 10,
+				))
+				.encode()
+				.into(),
+			})
+			.await;
+		handler.process_pending_affinities();
+		assert_eq!(handler.pending_initial_syncs[&peers[0]].sync_id, id);
+		assert!(handler.peers[&peers[0]].pending_topic_affinity.is_none());
+	}
+
+	#[tokio::test]
+	async fn full_replication_defers_repair_while_major_syncing() {
+		let (mut handler, store, _, notifications, _, peers) = build_handler(1);
+		enable_full_replication(&mut handler);
+		store.insert(new_live_statement());
+		let (sync, flag) = TestSync::with_syncing(true);
+		handler.sync = sync;
+		let now = Instant::now();
+		handler.service_full_replication(now);
+		assert!(handler.pending_initial_syncs.is_empty());
+		flag.store(false, Ordering::Relaxed);
+		handler.service_full_replication(now + std::time::Duration::from_secs(1));
+		handler.flush_pending_sends().await;
+		assert_eq!(get_peer_hashes(&notifications.get_sent_notifications(), peers[0]).len(), 1);
+	}
+
+	#[tokio::test]
+	async fn full_replication_policy_rejections_and_pending_duplicates_are_neutral() {
+		let (mut handler, _, network, _, receiver, peers) = build_handler(1);
+		enable_full_replication(&mut handler);
+		let peer = peers[0];
+		let statement = new_live_statement();
+		handler.on_statements(peer, vec![statement.clone(), statement]);
+		assert_eq!(receiver.len(), 1);
+		assert!(network.get_reports().is_empty());
+		for result in [
+			SubmitResult::Known,
+			SubmitResult::KnownExpired,
+			SubmitResult::Rejected(sp_statement_store::RejectionReason::NoAllowance),
+			SubmitResult::Invalid(sp_statement_store::InvalidReason::AlreadyExpired),
+		] {
+			handler.on_handle_statement_import(peer, &result);
+		}
+		assert!(network.get_reports().is_empty());
+		handler.on_handle_statement_import(
+			peer,
+			&SubmitResult::Invalid(sp_statement_store::InvalidReason::BadProof),
+		);
+		assert_eq!(network.get_reports(), vec![(peer, rep::INVALID_STATEMENT)]);
+	}
+
+	#[tokio::test]
+	async fn full_replication_repairs_outbox_overflow() {
+		let (mut handler, store, _, notifications, _, peers) = build_handler(1);
+		enable_full_replication(&mut handler);
+		let peer = peers[0];
+		let mut entries = Vec::new();
+		for i in 0..=MAX_PROPAGATION_OUTBOX_LEN {
+			let mut statement = new_live_statement();
+			statement.set_plain_data(i.to_le_bytes().to_vec());
+			statement.set_proof(sp_statement_store::Proof::Ed25519 {
+				signature: [0; 64],
+				signer: [1; 32],
+			});
+			let hash = statement.hash();
+			store.insert(statement.clone());
+			entries.push((i as u64, hash, statement));
+		}
+		// Occupied slot lets the real hash outbox overflow before any send can drain it.
+		handler.occupy_send_slot(peer);
+		handler.do_propagate_statements(&entries);
+		assert_eq!(handler.propagation_outboxes[&peer].len(), MAX_PROPAGATION_OUTBOX_LEN);
+		assert!(!handler.propagation_outboxes[&peer].contains(&entries[0].1));
+		handler.in_flight_chunks.remove(&peer);
+		handler.service_full_replication(Instant::now());
+		for _ in 0..32 {
+			handler.flush_pending_sends().await;
+			if !handler.pending_initial_syncs.contains_key(&peer) {
+				break;
+			}
+			handler.process_initial_sync_burst();
+		}
+		let sent = get_peer_hashes(&notifications.get_sent_notifications(), peer);
+		assert_eq!(sent, entries.iter().map(|(_, hash, _)| *hash).collect::<Vec<_>>());
+		assert!(handler.pending_initial_syncs.is_empty());
+	}
+
+	#[tokio::test]
+	async fn full_replication_reoffers_after_receiver_queue_pressure() {
+		let (mut sender, store, _, notifications, _, sender_peers) = build_handler(1);
+		let (mut receiver, _, _, _, validation, receiver_peers) = build_handler(1);
+		enable_full_replication(&mut sender);
+		enable_full_replication(&mut receiver);
+		let from = receiver_peers[0];
+		for i in 0..100u8 {
+			let mut statement = new_live_statement();
+			statement.set_plain_data(vec![i]);
+			receiver.on_statements(from, vec![statement]);
+		}
+		assert_eq!(validation.len(), 100);
+		let mut lost = new_live_statement();
+		lost.set_plain_data(b"queue was full".to_vec());
+		let hash = lost.hash();
+		store.insert(lost.clone());
+		receiver.on_statements(from, vec![lost]);
+		assert!(!receiver.pending_statements_peers.contains_key(&hash));
+		while let Ok((_, completion)) = validation.try_recv() {
+			let _ = completion.send(SubmitResult::Known);
+		}
+		// Sender's successful network send would not reveal the receiver's queue drop.
+		sender.service_full_replication(Instant::now());
+		sender.flush_pending_sends().await;
+		let sent = notifications.get_sent_notifications();
+		assert_eq!(get_peer_hashes(&sent, sender_peers[0]), vec![hash]);
+		let records = Statements::decode(&mut sent[0].1.as_slice()).unwrap();
+		receiver.on_statements(from, records);
+		let (accepted, _) = validation.try_recv().unwrap();
+		assert_eq!(accepted.hash(), hash);
+	}
+
+	#[tokio::test]
+	async fn full_replication_wire_ceiling_fits_both_protocols() {
+		use sp_core::Pair;
+		for version in [PeerProtocolVersion::V1, PeerProtocolVersion::V2] {
+			let (mut handler, store, _, notifications, _, peers) = build_handler(1);
+			enable_full_replication(&mut handler);
+			handler.peers.get_mut(&peers[0]).unwrap().protocol_version = version;
+			let pair = sp_core::ed25519::Pair::from_seed(&[7; 32]);
+			let mut statement = new_live_statement();
+			statement.set_plain_data(vec![0; FULL_REPLICATION_MAX_STATEMENT_SIZE]);
+			statement.sign_ed25519_private(&pair);
+			let overhead = statement.encode().len() - FULL_REPLICATION_MAX_STATEMENT_SIZE;
+			statement.set_plain_data(vec![0; FULL_REPLICATION_MAX_STATEMENT_SIZE - overhead]);
+			statement.sign_ed25519_private(&pair);
+			assert_eq!(statement.encode().len(), FULL_REPLICATION_MAX_STATEMENT_SIZE);
+			let hash = statement.hash();
+			store.insert(statement);
+			handler.schedule_initial_sync_for_peer(peers[0]);
+			handler.process_initial_sync_burst();
+			handler.flush_pending_sends().await;
+			let sent = notifications.get_sent_notifications();
+			assert_eq!(sent.len(), 1);
+			assert!(sent[0].1.len() <= MAX_STATEMENT_NOTIFICATION_SIZE as usize);
+			let records = match version {
+				PeerProtocolVersion::V1 => {
+					StatementBatch::decode(&mut sent[0].1.as_slice()).unwrap()
+				},
+				PeerProtocolVersion::V2 => {
+					match StatementMessage::decode(&mut sent[0].1.as_slice()).unwrap() {
+						StatementMessage::Statements(records) => records,
+						_ => panic!("expected statements"),
+					}
+				},
+			};
+			assert_eq!(records[0].hash(), hash);
+		}
 	}
 
 	#[tokio::test]
@@ -5700,6 +6152,9 @@ mod tests {
 				is_light,
 				pending_topic_affinity: None,
 				sync_watermark: 0,
+				full_replica: false,
+				replay_turn: false,
+				next_repair_at: Instant::now(),
 			}
 		};
 
@@ -5847,6 +6302,8 @@ mod tests {
 
 		let mut handler = StatementHandler {
 			protocol_name: format!("/{STATEMENT_PROTOCOL_V1}").into(),
+			full_replication: None,
+			full_replication_service_at: Instant::now(),
 			notification_service: Box::new(notification_service.clone()),
 			propagate_timeout: (Box::pin(futures::stream::pending())
 				as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -5968,6 +6425,9 @@ mod tests {
 				is_light: false,
 				pending_topic_affinity: None,
 				sync_watermark: 0,
+				full_replica: false,
+				replay_turn: false,
+				next_repair_at: Instant::now(),
 			},
 		);
 
@@ -6347,6 +6807,8 @@ mod tests {
 
 		let mut handler = StatementHandler {
 			protocol_name: "/statement/1".into(),
+			full_replication: None,
+			full_replication_service_at: Instant::now(),
 			notification_service: Box::new(notification_service),
 			propagate_timeout: (Box::pin(futures::stream::pending())
 				as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -6430,6 +6892,8 @@ mod tests {
 
 		let mut handler = StatementHandler {
 			protocol_name: "/statement/1".into(),
+			full_replication: None,
+			full_replication_service_at: Instant::now(),
 			notification_service: Box::new(notification_service),
 			propagate_timeout: (Box::pin(futures::stream::pending())
 				as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -6519,11 +6983,16 @@ mod tests {
 				is_light: false,
 				pending_topic_affinity: None,
 				sync_watermark: 0,
+				full_replica: false,
+				replay_turn: false,
+				next_repair_at: Instant::now(),
 			},
 		);
 
 		let mut handler = StatementHandler {
 			protocol_name: format!("/{STATEMENT_PROTOCOL_V1}").into(),
+			full_replication: None,
+			full_replication_service_at: Instant::now(),
 			notification_service: Box::new(notification_service),
 			propagate_timeout: (Box::pin(futures::stream::pending())
 				as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -6631,6 +7100,9 @@ mod tests {
 			is_light: false,
 			pending_topic_affinity: None,
 			sync_watermark: 0,
+			full_replica: false,
+			replay_turn: false,
+			next_repair_at: Instant::now(),
 		};
 
 		let make_handler =
@@ -6641,6 +7113,8 @@ mod tests {
 				peers.insert(PeerId::random(), make_peer());
 				StatementHandler {
 					protocol_name: format!("/{STATEMENT_PROTOCOL_V1}").into(),
+					full_replication: None,
+					full_replication_service_at: Instant::now(),
 					notification_service: Box::new(TestNotificationService::new()),
 					propagate_timeout: (Box::pin(futures::stream::pending())
 						as Pin<Box<dyn Stream<Item = ()> + Send>>)
@@ -6730,6 +7204,9 @@ mod tests {
 			is_light: false,
 			pending_topic_affinity: None,
 			sync_watermark: 0,
+			full_replica: false,
+			replay_turn: false,
+			next_repair_at: Instant::now(),
 		};
 		let who = PeerId::random();
 		let received = HashMap::new();
