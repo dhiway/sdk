@@ -1289,13 +1289,17 @@ impl Store {
 				NUM_FILTER_WORKERS,
 			),
 		};
-		store.populate(needs_index_migration)?;
+		// Legacy empty journal rows cannot establish which removal they belong to.
+		// Gate activation before migration/maintenance can erase a newer legacy ban.
 		store.validate_full_replication_state()?;
+		store.populate(needs_index_migration)?;
 		Ok(store)
 	}
 
 	/// Full replicas must not start with records that cannot be repaired, or tombstones
-	/// whose historical automatic/explicit cause cannot be recovered.
+	/// whose historical automatic/explicit cause cannot be recovered. This preflight runs
+	/// before any legacy journal reconciliation; even an apparently due row is ambiguous.
+	/// Recovery uses the existing disabled-mode suppression policy and maintenance before retrying.
 	fn validate_full_replication_state(&self) -> Result<()> {
 		let config = self.submit_index.read().config;
 		if config.full_replication.is_none() {
@@ -1303,15 +1307,10 @@ impl Store {
 		}
 		let mut invalid = None;
 		self.db.iter_column_while(col::EXPIRED, |item| {
-			let ban = Eviction::decode(&item.value, config.purge_after_sec).and_then(|ban| {
-				// Startup maintenance may have removed this raw row in the commit overlay.
-				self.db.get(col::EXPIRED, &ban.hash).map_err(|e| Error::Db(e.to_string()))?
-					.map(|value| Eviction::decode(&value, config.purge_after_sec)).transpose()
-			});
-			match ban {
-				Ok(Some(ban)) if ban.explicit.is_none() => {
+			match Eviction::decode(&item.value, config.purge_after_sec) {
+				Ok(ban) if ban.explicit.is_none() => {
 					invalid = Some(Error::InvalidConfig(format!(
-						"full replication cannot classify legacy suppression for {}; keep full replication disabled until the existing purge journal has removed this row",
+						"full replication cannot classify legacy suppression for {}; keep full replication disabled; after the legacy removals' suppression periods have elapsed, run maintenance under the existing policy before retrying",
 						HexDisplay::from(&ban.hash))));
 				},
 				Err(e) => invalid = Some(e),

@@ -215,6 +215,42 @@ fn legacy_suppression_blocks_activation_without_being_erased() {
 }
 
 #[test]
+fn legacy_stale_purge_cannot_erase_a_newer_legacy_ban_before_activation() {
+	// Reproduce baseline-generated state: remove at t=0 (deadline 10), authorized
+	// re-admit then remove at t=5 (deadline 15), leaving both empty journal rows.
+	// Opening in full mode at t=10 must reject activation without purging either row.
+	for version in [crate::CURRENT_VERSION, 1] {
+		let (store, temp) = test_store();
+		let hash = statement(1, 1, None, 100).hash();
+		let t10 = store.timestamp();
+		let newer_legacy_ban = (hash, t10 - 5).encode();
+		let old_journal = crate::evicted_index_key(t10, &hash);
+		let new_journal = crate::evicted_index_key(t10 + 5, &hash);
+		store
+			.db
+			.commit([
+				(col::META, KEY_VERSION.to_vec(), Some(version.to_le_bytes().to_vec())),
+				(col::EXPIRED, hash.to_vec(), Some(newer_legacy_ban.clone())),
+				(col::INDEX_EVICTED, old_journal.clone(), Some(Vec::new())),
+				(col::INDEX_EVICTED, new_journal.clone(), Some(Vec::new())),
+			])
+			.unwrap();
+		let mut config = store.submit_index.read().config;
+		config.purge_after_sec = 10;
+		config.full_replication = Some(FullReplication::default());
+		drop(store);
+		assert!(matches!(reopen(&temp, config), Err(crate::Error::InvalidConfig(_))));
+		// Inspect directly: reopening in default mode would invoke the historical purge
+		// behavior that this full-mode preflight must never run ahead of its safety gate.
+		let db = Store::open_db(&temp.path().join("db/statements")).unwrap();
+		assert_eq!(db.get(col::EXPIRED, &hash).unwrap(), Some(newer_legacy_ban));
+		assert_eq!(db.get(col::INDEX_EVICTED, &old_journal).unwrap(), Some(Vec::new()));
+		assert_eq!(db.get(col::INDEX_EVICTED, &new_journal).unwrap(), Some(Vec::new()));
+		assert_eq!(db.get(col::META, KEY_VERSION).unwrap(), Some(version.to_le_bytes().to_vec()));
+	}
+}
+
+#[test]
 fn stale_legacy_and_tagged_purges_cannot_erase_a_new_explicit_ban() {
 	for legacy in [false, true] {
 		let (mut store, _temp) = full_store();
