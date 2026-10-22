@@ -50,6 +50,8 @@
 #![deny(missing_docs)]
 #![deny(unused_crate_dependencies)]
 
+// AUX is a reserved directory name on Windows; keep the Rust API unchanged.
+#[path = "auxiliary/mod.rs"]
 pub mod aux;
 pub mod builders;
 pub mod chain;
