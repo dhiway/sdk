@@ -1013,8 +1013,8 @@ fn has_received_from(
 	hash: &Hash,
 	who: &PeerId,
 ) -> bool {
-	recently_received_statements.get(hash).is_some_and(|peers| peers.contains(who)) ||
-		pending_statements_peers.get(hash).is_some_and(|peers| peers.contains(who))
+	recently_received_statements.get(hash).is_some_and(|peers| peers.contains(who))
+		|| pending_statements_peers.get(hash).is_some_and(|peers| peers.contains(who))
 }
 
 impl Peer {
@@ -1036,17 +1036,17 @@ impl Peer {
 	}
 
 	fn matches_statement(&self, statement: &Statement) -> bool {
-		self.full_replica ||
-			self.topic_affinity.as_ref().is_none_or(|a| a.matches_statement(statement))
+		self.full_replica
+			|| self.topic_affinity.as_ref().is_none_or(|a| a.matches_statement(statement))
 	}
 
 	/// Whether this peer is ready to receive statements.
 	///
 	/// Light V2 peers must set their topic affinity before receiving any statements.
 	fn can_receive(&self) -> bool {
-		!(self.is_light &&
-			self.protocol_version == PeerProtocolVersion::V2 &&
-			self.topic_affinity.is_none())
+		!(self.is_light
+			&& self.protocol_version == PeerProtocolVersion::V2
+			&& self.topic_affinity.is_none())
 	}
 
 	fn kind(&self) -> &'static str {
@@ -1193,9 +1193,9 @@ where
 			.peers
 			.iter()
 			.filter_map(|(id, peer)| {
-				(peer.full_replica &&
-					now >= peer.next_repair_at &&
-					!self.pending_initial_syncs.contains_key(id))
+				(peer.full_replica
+					&& now >= peer.next_repair_at
+					&& !self.pending_initial_syncs.contains_key(id))
 				.then_some(*id)
 			})
 			.collect();
@@ -1418,16 +1418,16 @@ where
 						rate_limiter: PeerRateLimiter::new(
 							self.statements_per_second,
 							NonZeroU32::new(
-								self.statements_per_second.get() *
-									config::STATEMENTS_BURST_COEFFICIENT,
+								self.statements_per_second.get()
+									* config::STATEMENTS_BURST_COEFFICIENT,
 							)
 							.expect("burst capacity is nonzero"),
 						),
 						send_budget: PeerRateLimiter::new(
 							self.statements_per_second,
 							NonZeroU32::new(
-								self.statements_per_second.get() *
-									config::STATEMENTS_BURST_COEFFICIENT,
+								self.statements_per_second.get()
+									* config::STATEMENTS_BURST_COEFFICIENT,
 							)
 							.expect("burst capacity is nonzero"),
 						),
@@ -1814,8 +1814,8 @@ where
 	/// slow peer holds one encoded chunk, not its whole backlog. Hashes whose statements left
 	/// the store since they were queued are dropped.
 	fn try_send_next_chunk(&mut self, who: PeerId) {
-		if self.peers.get(&who).is_some_and(|p| p.full_replica && p.replay_turn) &&
-			self.pending_initial_syncs.contains_key(&who)
+		if self.peers.get(&who).is_some_and(|p| p.full_replica && p.replay_turn)
+			&& self.pending_initial_syncs.contains_key(&who)
 		{
 			return;
 		}
@@ -1910,8 +1910,8 @@ where
 			};
 			let bytes_sent = encoded.len() as u64;
 			let Some(message_sink) = self.notification_service.message_sink(&who) else {
-				let abandoned = statement_count +
-					self.propagation_outboxes.get(&who).map_or(0, |outbox| outbox.len());
+				let abandoned = statement_count
+					+ self.propagation_outboxes.get(&who).map_or(0, |outbox| outbox.len());
 				log::debug!(
 					target: LOG_TARGET,
 					"Failed to get message sink for peer {who}, abandoning {abandoned} statements ({bytes_sent} bytes in the current chunk)",
@@ -2158,8 +2158,8 @@ where
 			.peers
 			.iter()
 			.filter(|(peer_id, peer_data)| {
-				peer_data.pending_topic_affinity.is_some() &&
-					!self.pending_initial_syncs.contains_key(peer_id)
+				peer_data.pending_topic_affinity.is_some()
+					&& !self.pending_initial_syncs.contains_key(peer_id)
 			})
 			.map(|(peer_id, _)| *peer_id)
 			.collect();
@@ -2306,9 +2306,9 @@ where
 			self.record_initial_sync_completion(sync_outcome::ABANDONED, pending.started_at);
 			return;
 		};
-		if peer_data.full_replica &&
-			!peer_data.replay_turn &&
-			self.propagation_outboxes.get(&peer_id).is_some_and(|q| !q.is_empty())
+		if peer_data.full_replica
+			&& !peer_data.replay_turn
+			&& self.propagation_outboxes.get(&peer_id).is_some_and(|q| !q.is_empty())
 		{
 			self.initial_sync_peer_queue.push_back(peer_id);
 			self.try_send_next_chunk(peer_id);

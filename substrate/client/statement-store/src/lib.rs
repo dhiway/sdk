@@ -358,9 +358,9 @@ struct EntryDetails {
 
 impl Encode for EntryDetails {
 	fn size_hint(&self) -> usize {
-		self.channel.size_hint() +
-			(self.data_len as u32).size_hint() +
-			self.admission_seq.size_hint()
+		self.channel.size_hint()
+			+ (self.data_len as u32).size_hint()
+			+ self.admission_seq.size_hint()
 	}
 
 	fn encode_to<T: codec::Output + ?Sized>(&self, dest: &mut T) {
@@ -898,8 +898,8 @@ impl SubmitIndex {
 		}
 		self.cached_statement_count += record.by_priority.len();
 		self.account_statements.insert(account, record);
-		while self.cached_statement_count > DETAILS_CACHE_BUDGET &&
-			self.account_statements.len() > 1
+		while self.cached_statement_count > DETAILS_CACHE_BUDGET
+			&& self.account_statements.len() > 1
 		{
 			match self.account_statements.pop_oldest() {
 				Some((_, evicted)) => self.cached_statement_count -= evicted.by_priority.len(),
@@ -1001,8 +1001,8 @@ impl SubmitIndex {
 		if let Some(channel) = statement.channel() {
 			if let Some(channel_record) = record.channels.get(&channel) {
 				if if full_replication {
-					priority <=
-						PriorityKey { hash: channel_record.hash, expiry: channel_record.expiry }
+					priority
+						<= PriorityKey { hash: channel_record.hash, expiry: channel_record.expiry }
 				} else {
 					expiry <= channel_record.expiry
 				} {
@@ -1043,8 +1043,8 @@ impl SubmitIndex {
 		}
 		// Check if we can evict enough lower priority statements to satisfy constraints
 		for (entry, details) in record.by_priority.iter() {
-			if (record.data_size - would_free_size + statement_len <= max_size) &&
-				record.by_priority.len() + 1 - evicted_hashes.len() <= max_count
+			if (record.data_size - would_free_size + statement_len <= max_size)
+				&& record.by_priority.len() + 1 - evicted_hashes.len() <= max_count
 			{
 				// Satisfied
 				break;
@@ -1079,8 +1079,8 @@ impl SubmitIndex {
 			evicted.push((*entry, *details));
 		}
 		// Now check global constraints as well.
-		if !((self.total_size - would_free_size + statement_len <= self.config.max_total_size) &&
-			self.statement_count + 1 - evicted.len() <= self.config.max_total_statements)
+		if !((self.total_size - would_free_size + statement_len <= self.config.max_total_size)
+			&& self.statement_count + 1 - evicted.len() <= self.config.max_total_statements)
 		{
 			log::debug!(
 				target: LOG_TARGET,
@@ -2152,9 +2152,9 @@ impl Store {
 		let mut cursor = self.submit_index.read().allowance_cursor;
 		let mut checked = 0usize;
 		let mut wrapped = false;
-		while checked < account_budget &&
-			allowance_budget > 0 &&
-			allowance_start.elapsed() < time_budget
+		while checked < account_budget
+			&& allowance_budget > 0
+			&& allowance_start.elapsed() < time_budget
 		{
 			let from = cursor.unwrap_or([0u8; 32]);
 			let account = match self.next_account_from(&from) {
@@ -2903,14 +2903,14 @@ impl StatementStore for Store {
 			// statement is rejected by `plan_insert` before it ever looks at the record.
 			let oversize = statement_len > validation.max_size as usize;
 			let cached = submit_index.account_statements.peek(&account_id).is_some();
-			let summary_admits = !cached &&
-				statement.channel().is_none() &&
-				submit_index.summaries.peek(&account_id).is_some_and(|summary| {
-					summary.count < validation.max_count as usize &&
-						summary.data_size + statement_len <= validation.max_size as usize
-				}) && submit_index.statement_count <
-				submit_index.config.max_total_statements &&
-				submit_index.total_size + statement_len <= submit_index.config.max_total_size;
+			let summary_admits = !cached
+				&& statement.channel().is_none()
+				&& submit_index.summaries.peek(&account_id).is_some_and(|summary| {
+					summary.count < validation.max_count as usize
+						&& summary.data_size + statement_len <= validation.max_size as usize
+				}) && submit_index.statement_count
+				< submit_index.config.max_total_statements
+				&& submit_index.total_size + statement_len <= submit_index.config.max_total_size;
 			let loaded_record = if cached || summary_admits || oversize {
 				None
 			} else {
@@ -3302,8 +3302,8 @@ impl Store {
 					HexDisplay::from(hash)
 				),
 			}
-			let banned = current_time < expiry.get_expiration_timestamp_secs() &&
-				(explicit || submit_index.config.full_replication.is_none());
+			let banned = current_time < expiry.get_expiration_timestamp_secs()
+				&& (explicit || submit_index.config.full_replication.is_none());
 			let previous_ban =
 				self.db.get(col::EXPIRED, hash).map_err(|e| Error::Db(e.to_string()))?;
 			if banned {
@@ -5138,8 +5138,8 @@ mod tests {
 			// Topic and key sets contain both A & B entries.
 			assert!(store.index_has_topic(&t42, &h_a1) && store.index_has_topic(&t42, &h_b2));
 			assert!(
-				store.index_has_dec_key(&Some(k7), &h_a2) &&
-					store.index_has_dec_key(&Some(k7), &h_b2)
+				store.index_has_dec_key(&Some(k7), &h_a2)
+					&& store.index_has_dec_key(&Some(k7), &h_b2)
 			);
 		}
 

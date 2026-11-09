@@ -756,13 +756,13 @@ impl Statement {
 			.map_or(0, |d| 1 + Compact::<u32>::max_encoded_len() + d.len());
 		let compact_prefix_size = if !for_signing { Compact::<u32>::max_encoded_len() } else { 0 };
 
-		compact_prefix_size +
-			proof_size +
-			decryption_key_size +
-			expiry_size +
-			channel_size +
-			topics_size +
-			data_size
+		compact_prefix_size
+			+ proof_size
+			+ decryption_key_size
+			+ expiry_size
+			+ channel_size
+			+ topics_size
+			+ data_size
 	}
 
 	#[allow(deprecated)]
@@ -770,11 +770,11 @@ impl Statement {
 		// Encoding matches that of Vec<Field>. Basically this just means accepting that there
 		// will be a prefix of vector length.
 		// Expiry field is always present.
-		let num_fields = if !for_signing && self.proof.is_some() { 2 } else { 1 } +
-			if self.decryption_key.is_some() { 1 } else { 0 } +
-			if self.channel.is_some() { 1 } else { 0 } +
-			if self.data.is_some() { 1 } else { 0 } +
-			self.num_topics as u32;
+		let num_fields = if !for_signing && self.proof.is_some() { 2 } else { 1 }
+			+ if self.decryption_key.is_some() { 1 } else { 0 }
+			+ if self.channel.is_some() { 1 } else { 0 }
+			+ if self.data.is_some() { 1 } else { 0 }
+			+ self.num_topics as u32;
 
 		let mut output = Vec::with_capacity(self.estimated_encoded_size(for_signing));
 		// When encoding signature payload, the length prefix is omitted.

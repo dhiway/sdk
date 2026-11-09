@@ -865,8 +865,8 @@ fn bench_contention(c: &mut Criterion) {
 		b.iter_batched(
 			|| {
 				let (store, temp) = setup_scaled(&keypair, CONTENTION_PRELOAD);
-				let writes: Vec<Statement> = (CONTENTION_PRELOAD..
-					CONTENTION_PRELOAD + CONTENTION_WRITERS * OPS_PER_THREAD)
+				let writes: Vec<Statement> = (CONTENTION_PRELOAD
+					..CONTENTION_PRELOAD + CONTENTION_WRITERS * OPS_PER_THREAD)
 					.map(|i| {
 						create_signed_statement(i as u64, &[topic(0), topic(1)], None, &keypair)
 					})
