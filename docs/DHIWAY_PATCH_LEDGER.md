@@ -1,72 +1,84 @@
-# Dhiway SDK patch ledger: release-v1.25.0
+# Dhiway SDK patch ledger: stable2609-1
 
-Prepared from exact upstream `polkadot-stable2609` / peeled `polkadot-v1.25.0`
-commit `7a8daa68e18718c18823c1109513fdc1c8aa71fe`, released 2026-10-12.
-Owner instruction 2026-10-14 requests this local release branch and current custom
-patch carry. The pre-release stack permits a clean break; no Dhiway migration
-framework or legacy SDK API adapter is introduced. Standard upstream code stays
-intact. Existing release/development branches and consumer pins are unchanged.
+Updated 9 November 2026 for the isolated T311.37 / P36 producer upgrade.
+The merge adopts released upstream `polkadot-stable2609-1` / node v1.25.1,
+commit `6ab53982513b24e03de15736cb45a87e5daa6919`, preserving both its
+ancestry and the existing fork head `aa886dd1c64ab77de82b47eb1e909f9d3b3ff336`.
+The earlier upstream base was `polkadot-stable2609`, commit
+`7a8daa68e18718c18823c1109513fdc1c8aa71fe`. No rebase, consumer re-pin,
+publication, network reset or deployment is part of this SDK source change.
 
-## Current custom patch disposition
+## Carry map
 
-Inventory compared old fork `002ba334e45ed6a44f2ee1cb4fb56758c14fb074`
-with upstream stable2606-2 `72284b37a234f8a1565f2043ddbf8280a69fcf29`.
-Only four files differ: root manifest/lock, sp-tracing manifest, and the former
-patch ledger. Historical CLI-name patches absent from that live fork are not revived.
+The previous fork had fourteen commits over the earlier upstream base, touching
+twelve files. Compare the resulting tree with the exact new upstream, rather
+than treating every historical fork commit as a remaining custom patch.
 
-| Path | Disposition | Reason |
+| Existing fork change | Disposition at stable2609-1 | Reason |
 | --- | --- | --- |
-| `Cargo.toml` | Use workspace tracing-subscriber minimum0.3.20 with normal compatible SemVer. | stable2609 still pins 0.3.19; 0.3.20 addresses RUSTSEC-2025-0055. |
-| `Cargo.lock` | Regenerate only the necessary matching Cargo resolution. | Owning-tool update; never copy the old release lock. |
-| `substrate/primitives/tracing/Cargo.toml` | Retire the separate override; retain the exact upstream workspace inheritance. | The shared workspace requirement now carries the same compatibility intent for current 0.3.23 consumers. The original standalone source patch 002ba334 remains on the older branch. |
-| `docs/DHIWAY_PATCH_LEDGER.md` | Replace with this branch's record. | Keep the exact new upstream base and current delta auditable. |
+| `64d8f6f739fe922f33891981ba20e92eb18b14a9`: workspace tracing-subscriber minimum 0.3.20 | Retain the root manifest and its existing lock resolution | Upstream still requires exact 0.3.19. The shared minimum carries RUSTSEC-2025-0055 remediation and permits current compatible downstream versions; no separate sp-tracing override. |
+| `ed93bbc5b824abb5b9a07a999eed25391aa5e596`: original ledger | Replace stale current-state claims with this inventory | Historical baseline verification remains below and in its receipt; it does not describe the later native Statement delta. |
+| `9d10387e62`: best/finalized allowance enforcement | Upstream-equivalent; no separate custom hunk remains | Upstream `1926bb6275c` carries the same fix. Git reconciles it without a duplicate implementation; retain its upstream regression. |
+| `552780e2e3`: reject non-contributory X25519 ephemeral keys | Retain `substrate/primitives/statement-store/src/ecies.rs` and its forged-ciphertext regression | This released upstream still lacks the check. A non-contributory exchange must reject with BadData. |
+| `bc385072a5`: paced native admission replay | Retain in `substrate/client/network/statement/src/lib.rs` | This released upstream lacks the carried replay pacing; do not replace native Statement transport with another sync system. |
+| `39800e39a9`, `9955298eb8`: opt-in full-replication configuration and interval validation | Retain network configuration and native Store/handler integration | Defaults remain disabled. Invalid or unrepresentable repair intervals reject rather than panic or busy-loop. |
+| `f725d22fd5`, `5797957c4e`: deterministic admission, repair-safe eviction and authoritative tombstones | Retain Store implementation and regressions | Equal priorities converge under the selected policy; automatic eviction can be repaired while explicit suppression remains authoritative. |
+| `3187611b09`: bounded full-peer repair | Retain native handler replay, bounded sends and fairness | Complete retained-feed replication needs replay after reconnect and periodic repair, not only new-message gossip. |
+| `828b960f7d`, `aa886dd1c6`: activation and genuine legacy-layout preflight | Retain the existing explicit legacy-layout decision | Inspect authoritative columns before expanding layout or maintenance. Reject ambiguous suppression or unsendable retained records without inventing provenance or erasing state. |
+| `6000e7af17`: config forwarding and affinity flood checks | Retain native SDK constructors and network checks | Both native node constructors forward the same option; full-mode affinity does not bypass rate accounting. |
+| `fa4528dcef`: busy run-loop and real Store/wire composition tests | Retain both test modules | Exercise two full peers despite continuously ready live ticks, and actual Store live/replay V1/V2 encoding boundaries. |
+| New root `rust-toolchain.toml` | Pin Rust 1.93.0 with rustfmt, Clippy, rust-src and wasm32v1-none | Matches upstream `.github/env` CI image and the previously accepted SDK toolchain. Makes the exact archived tree self-describing for the existing isolated AWS runner; no consumer toolchain is changed. |
 
-Official security source: [tracing advisory GHSA-xwfj-jgwm-7wp5](https://github.com/tokio-rs/tracing/security/advisories/GHSA-xwfj-jgwm-7wp5).
+The full upstream patch release is merged intact, including its native, runtime,
+manifest/lock and release-note changes. Only the carried Store allowance fix is
+already upstream-equivalent. The remaining custom source paths, beyond the
+root toolchain and ledger, are:
 
-The new branch combines both tracing fixes in one shared dependency requirement.
-The root lock still selects 0.3.20 reproducibly; the manifest no longer imposes an
-exact old subscriber version on current downstream library users. No separate
-sp-tracing manifest delta or compatibility shim is needed.
+- `Cargo.toml` and `Cargo.lock` (shared tracing requirement and its prior resolution).
+- `substrate/primitives/statement-store/src/ecies.rs`.
+- `substrate/client/network/statement/src/config.rs`, `src/lib.rs` and
+  `src/full_replication_tests.rs`.
+- `substrate/client/statement-store/src/lib.rs` and `src/tests/full_replication.rs`.
+- `substrate/bin/node/cli/src/service.rs` and
+  `cumulus/polkadot-omni-node/lib/src/{cli.rs,common/statement_store.rs}`.
 
-## Statement Store baseline
+The inherited lock resolution is merged, not hand-regenerated or copied from
+another release. Its remaining difference from upstream includes the previously
+accepted transitive tracing-resolution changes. Locked Cargo preparation and
+checks must validate the merged manifest/lock before consumer adoption.
 
-No custom Statement Store, gossip, RPC, runtime or quota source overrides are
-carried. All new Statement changes are the exact stable2609 upstream code.
-Relevant upstream improvements include persisted admission-cursor subscription
-replay, admission-journal initial gossip sync, bounded per-peer outboxes and
-inbound batches, nonblocking initial sync/propagation, expired-message filtering,
-depleted-allowance rejection, index optimizations and multi-topic notification fixes.
+## Behavior and legacy-layout boundary
 
-The native APIs change, including recent-statement admission sequence tuples,
-admission watermark/cursor walks and new subscriptions. Consumers should adopt
-these native APIs directly in separate assigned work; no compatibility shim is added.
-The upstream usage guide still disclaims guaranteed delivery/timing. Its journal
-skips entries whose Statements have left the store; it is not an application
-mailbox, permanent history or proof of recipient receipt.
+Full replication is opt-in and uses native Statement admission journals,
+watermarks, subscriptions and protocol messages. It preserves bounded per-peer
+work, flood accounting and live/replay fairness. Local admission or a finished
+replay is not a recipient acknowledgement or consensus durability proof.
+Convergence still requires compatible policies, sufficient capacity and a
+surviving eligible copy. Ordinary disabled-mode behavior remains supported.
 
-## Validation
+The existing legacy-layout preflight is deliberately retained, as required by
+this task; removal needs a separately explicit owner decision. In full mode,
+legacy suppression records cannot be classified as explicit or automatic from
+presence alone. Startup rejects them before column expansion, version updates
+or maintenance. Follow the existing disabled-mode maintenance/removal policy
+before retrying; do not silently reset the database or reinterpret old rows.
+Tests retain genuine three-column databases, suppression/reopen checks, malformed
+layout rejection and retained encoded-size activation checks.
 
-At source `64d8f6f739fe922f33891981ba20e92eb18b14a9`, using Rust 1.93.0 on
-macOS arm64, the following passed. This ledger's later documentation-only update
-preserves every production source/manifest/lock blob; the closing receipt binds
-that identity and the independent verdict to the actual branch head.
+## Verification boundary
 
-- `cargo +1.93.0 test --locked -p sp-statement-store -p sc-network-statement -p sc-statement-store -p pallet-statement --lib`:189 passed, 0 failed, 0 ignored (15 primitives, 85 network, 89 store; pallet compiled with 0 library tests). This is the committed-source rerun, separate from the earlier successful cold build.
-- `cargo +1.93.0 test --locked -p sp-tracing`:9 doctests passed,0 library unit tests.
-- Current external path consumer with exact tracing-subscriber 0.3.23: 2 captured-output/filtering regressions passed after the shared-minimum simplification. The same fixture against pure upstream failed dependency resolution on exact 0.3.19, as expected.
-- `cargo +1.93.0 clippy --locked -p sp-tracing --all-targets -- -D warnings`:passed.
-- `cargo +1.93.0 metadata --locked --offline --no-deps --format-version 1`, TOML parsing and scoped Git whitespace checks:passed.
-- A fresh exact-upstream-plus-one-line control regenerated a byte-identical lock. The accepted online update includes Cargo-selected transitive additions/edge rebindings; they are not claimed proved inherited. The earlier broad offline resolution was rejected and retained only as evidence.
+Historical accepted baseline: T268.187 at
+`aa886dd1c64ab77de82b47eb1e909f9d3b3ff336` passed 217 integrated primitive,
+network and Store unit tests, scoped strict Clippy, affected format checks and
+native SDK consumer checks. Those are previous results, not proof of this merge.
+T272.1 mapped the fork and requested this ledger correction at the next real
+source change; this update fulfills that advisory without rewriting its record.
 
-The test runtime's external-target-directory Cargo.lock auto-discovery warnings
-remain recorded. The final rerun supplied `WASM_BUILD_WORKSPACE_HINT`, but that
-variable alone does not invalidate the cached build script, whose warnings were
-replayed. No warning-free cold Wasm rebuild or Wasm reproducibility is claimed.
-`taplo format --check --config .config/taplo.toml Cargo.toml substrate/primitives/tracing/Cargo.toml`
-could not run because taplo is not installed. TOML syntax/metadata checks pass,
-and the manifest change preserves the upstream line's formatting.
-
-T268.169 retains exact commands, logs, source review and final head acceptance in
-project-context `receipts/t268-169-sdk-stable2609.json`. Full SDK matrices,
-consumer pin/adoption, live-chain interoperability, remote publication and full
-release qualification are separate; these component checks do not establish them.
+Current merge checks are recorded by the owning context task T311.37 receipt
+and exact-head AWS evidence. The planned development gates are primitive,
+network and Store library tests, scoped formatting and scoped strict all-target
+Clippy; native constructor changes are unchanged from the accepted fork but
+consumer adoption/typechecking belongs to P37/P38. Do not read a listed command
+as a passing result until its exact-head manifest/logs and independent review
+are recorded. Full SDK matrices, live multi-node/WAN churn and capacity,
+consumer pins, publication and production release qualification remain separate.
