@@ -1,4 +1,16 @@
-# Dhiway SDK patch ledger: stable2609-1
+# Dhiway SDK patch ledger
+
+## 18 November 2026 candidate for stable2609-2
+
+The isolated producer integrates upstream `polkadot-stable2609-2` (node v1.25.2),
+commit `9448fe4f252936d241b8d2663506813b884f94f3`, over fork
+`581558185ac0678f080728e863ab5b13a1dd39ac`. Git merged the upstream
+lockfile cleanly. The upstream change leaves the fork's Statement primitive,
+network worker, Store implementation and native configuration call sites
+unchanged. The existing retention and full-replication rules below apply.
+Consumer adoption requires verification at the selected fork commit.
+
+## 9 November 2026 integration of stable2609-1
 
 Updated 9 November 2026 for the isolated T311.37 / P36 producer upgrade.
 The merge adopts released upstream `polkadot-stable2609-1` / node v1.25.1,
@@ -74,7 +86,7 @@ native SDK consumer checks. Those are previous results, not proof of this merge.
 T272.1 mapped the fork and requested this ledger correction at the next real
 source change; this update fulfills that advisory without rewriting its record.
 
-Current merge checks are recorded by the owning context task T311.37 receipt
+The stable2609-1 merge checks are recorded by the owning context task T311.37 receipt
 and exact-head AWS evidence. The planned development gates are primitive,
 network and Store library tests, scoped formatting and scoped strict all-target
 Clippy; native constructor changes are unchanged from the accepted fork but

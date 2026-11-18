@@ -1863,6 +1863,8 @@ pub type Migrations = (
 	// incentive formula applies; pending pre-cutoff eras keep the legacy
 	// stake-only share, avoiding a `HistoryDepth × MaxValidatorSet` backfill.
 	pallet_staking_async::migrations::SetWeightedPointsFormulaStartEra<Runtime>,
+	// Stores the registration base deposit of every signed election submission.
+	pallet_election_provider_multi_block::signed::migrations::v1::MigrateV0ToV1<Runtime>,
 );
 
 /// Executive: handles dispatch to the various modules.
@@ -2752,6 +2754,13 @@ pallet_revive::impl_runtime_apis_plus_revive_traits!(
 				}
 				fn batch_call(calls: Vec<RuntimeCall>) -> Option<RuntimeCall> {
 					Some(RuntimeCall::Utility(pallet_utility::Call::batch { calls }))
+				}
+
+				fn wrap_call(call: RuntimeCall) -> Option<RuntimeCall> {
+					Some(RuntimeCall::Multisig(pallet_multisig::Call::as_multi_threshold_1 {
+						other_signatories: Vec::new(),
+						call: alloc::boxed::Box::new(call),
+					}))
 				}
 			}
 
